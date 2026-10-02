@@ -48,10 +48,16 @@ these.
   ±0.5 to ±2 s landed 0.23–0.74 s short; seeks of ±5 s landed within 5 ms.
   A timed resume-then-pause from paused moves the position by the time
   asked for, less about 0.04 s on average (seven trials, +0.017 to −0.082 s).
-- After a recording plays to its end the app reports `paused` at position 0,
-  still on that recording. A `resume` sent then makes it report `playing`
-  with the position stuck at 0; it never advances. A `play/recording` sent
-  then is dropped once and works when resent.
+- After a recording plays to its end the app is left in one of three states.
+  Seen: `stopped`, with nothing playing (a TV that had simply played the
+  recording through); `playing` at position 0, never advancing, still on
+  that recording (two TVs that had been synced to the first); and `paused`
+  at position 0, still on that recording. From the last, a `resume` makes it
+  report `playing` with the position stuck at 0. A `play/recording` sent in
+  the position-0 states is dropped once and works when resent.
+- The app answers a command before acting on it: the reply to a `stop`
+  still describes what was playing, and the status read about a second
+  later shows `stopped`.
 - Two TVs synced by reported position stayed within 35 ms of each other for
   20 minutes with no correction.
 
@@ -317,7 +323,7 @@ example "Living Room Channels", which may be renamed to an entity ID such as
 
 | Property | Source |
 | --- | --- |
-| State | `playing` / `paused` / `idle` (stopped) |
+| State | `playing` / `paused` / `idle` (stopped, or left at the end of a recording) |
 | Available | The app API answered the last poll |
 | Title, series, season, episode, artwork | `now_playing` |
 | `media_position`, `media_position_updated_at`, `media_duration` | `playback_time` and `duration` (recordings only) |
@@ -331,6 +337,17 @@ Supported: play, pause, stop, mute, seek to position (done as a relative
 seek from the current position), next/previous track (skip to the next or
 previous commercial marker), select source (tune a favourite channel), play
 media (a channel number or a recording ID).
+
+A recording reported at position 0 for 3 s or more, whether as `playing` or
+`paused`, has ended and the entity is `idle`. The 3 s keeps a recording that
+was just started from the beginning, which reports 0 for a second or two
+while it loads, from showing as idle. The sync actions read the app
+directly and do not apply this rule; a script should check the leader's
+entity state first.
+
+After every command the entity takes the app's reply as its state and reads
+the status again 1 s later, because the reply can describe the state before
+the command took effect.
 
 Polling is every 5 s while reachable and every 10 s while not. An
 unreachable app is an ordinary state and is not logged as an error. The sync

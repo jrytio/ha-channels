@@ -93,6 +93,103 @@ async def test_stopped_is_idle(hass, office_entry, client):
     assert hass.states.get(OFFICE).state == "idle"
 
 
+def at_zero(state: str, sampled_at: float):
+    """A recording reported at position 0, as the app does once it has ended."""
+    return status_of(
+        {**STATUS_RECORDING, "status": state, "playback_time": 0}, sampled_at
+    )
+
+
+async def poll(hass, seconds: float = 6) -> None:
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=seconds))
+    await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize("reported", ["playing", "paused"])
+async def test_recording_held_at_zero_is_idle(hass, office_entry, client, reported):
+    """An ended recording sits at position 0, reported as playing or paused."""
+    client.status.return_value = at_zero(reported, 1000.0)
+    await setup_integration(hass)
+    assert hass.states.get(OFFICE).state == reported
+
+    client.status.return_value = at_zero(reported, 1005.0)
+    await poll(hass)
+
+    assert hass.states.get(OFFICE).state == "idle"
+
+
+async def test_recording_at_zero_for_a_moment_is_still_playing(
+    hass, office_entry, client
+):
+    """A recording started from the beginning reports 0 while it loads."""
+    client.status.return_value = at_zero("playing", 1000.0)
+    await setup_integration(hass)
+
+    client.status.return_value = at_zero("playing", 1001.5)
+    await poll(hass)
+
+    assert hass.states.get(OFFICE).state == "playing"
+
+
+async def test_recording_that_moves_off_zero_is_playing_again(
+    hass, office_entry, client
+):
+    client.status.return_value = at_zero("playing", 1000.0)
+    await setup_integration(hass)
+    client.status.return_value = at_zero("playing", 1005.0)
+    await poll(hass)
+    assert hass.states.get(OFFICE).state == "idle"
+
+    client.status.return_value = status_of(STATUS_RECORDING, 1010.0)
+    await poll(hass)
+
+    assert hass.states.get(OFFICE).state == "playing"
+
+
+async def test_a_different_recording_at_zero_starts_the_wait_again(
+    hass, office_entry, client
+):
+    client.status.return_value = at_zero("playing", 1000.0)
+    await setup_integration(hass)
+
+    other = {
+        **STATUS_RECORDING,
+        "playback_time": 0,
+        "now_playing": {
+            **STATUS_RECORDING["now_playing"],
+            "thumb_url": "http://10.0.0.9:8089/dvr/files/999/preview.jpg",
+        },
+    }
+    client.status.return_value = status_of(other, 1005.0)
+    await poll(hass)
+
+    assert hass.states.get(OFFICE).state == "playing"
+
+
+async def test_live_tv_is_never_treated_as_ended(hass, office_entry, client):
+    client.status.return_value = status_of(STATUS_LIVE, 1000.0)
+    await setup_integration(hass)
+
+    client.status.return_value = status_of(STATUS_LIVE, 1005.0)
+    await poll(hass)
+
+    assert hass.states.get(OFFICE).state == "playing"
+
+
+async def test_stop_shows_without_waiting_for_the_next_poll(hass, office_entry, client):
+    """The app's reply to a stop still describes what was playing."""
+    await setup_integration(hass)
+    client.stop.return_value = status_of(STATUS_RECORDING)
+    client.status.return_value = status_of(STATUS_STOPPED)
+
+    await call(hass, MP_DOMAIN, "media_stop")
+    assert hass.states.get(OFFICE).state == "playing"
+
+    await poll(hass, seconds=1.5)
+
+    assert hass.states.get(OFFICE).state == "idle"
+
+
 async def test_app_not_in_front_at_startup_is_unavailable(hass, office_entry, client):
     client.status.side_effect = ChannelsConnectionError("asleep")
 

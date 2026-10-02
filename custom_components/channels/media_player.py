@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable
 from datetime import datetime
 from typing import Any
@@ -35,6 +36,10 @@ _CONTENT_TYPES = {
     "movie": MediaType.MOVIE,
     "video": MediaType.VIDEO,
 }
+# The app answers a command before acting on it, so the reply to a stop or a
+# play still describes what was on. Read again this long after each command.
+FOLLOW_UP = 1.0
+
 _RECORDING_TYPES = {
     MediaType.EPISODE,
     MediaType.MOVIE,
@@ -73,6 +78,8 @@ class ChannelsMediaPlayer(CoordinatorEntity[ChannelsAppCoordinator], MediaPlayer
     def __init__(self, coordinator: ChannelsAppCoordinator, entry: ConfigEntry) -> None:
         """Initialize the entity."""
         super().__init__(coordinator)
+        self._entry = entry
+        self._follow_up: asyncio.Task[None] | None = None
         self._attr_unique_id = entry.unique_id
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.unique_id)},
@@ -92,8 +99,12 @@ class ChannelsMediaPlayer(CoordinatorEntity[ChannelsAppCoordinator], MediaPlayer
 
     @property
     def state(self) -> MediaPlayerState | None:
-        """Return the playback state."""
-        return _STATES.get(self._status.state) if self._status else None
+        """Return the playback state; a recording left at its end is idle."""
+        if not self._status:
+            return None
+        if self.coordinator.ended:
+            return MediaPlayerState.IDLE
+        return _STATES.get(self._status.state)
 
     @property
     def is_volume_muted(self) -> bool | None:
@@ -198,6 +209,15 @@ class ChannelsMediaPlayer(CoordinatorEntity[ChannelsAppCoordinator], MediaPlayer
         except ChannelsError as err:
             raise HomeAssistantError(str(err)) from err
         self.coordinator.async_set_updated_data(status)
+        if self._follow_up:
+            self._follow_up.cancel()
+        self._follow_up = self._entry.async_create_background_task(
+            self.hass, self._async_read_again(), f"{DOMAIN} follow-up read"
+        )
+
+    async def _async_read_again(self) -> None:
+        await asyncio.sleep(FOLLOW_UP)
+        await self.coordinator.async_refresh()
 
     async def async_media_play(self) -> None:
         """Resume playback."""
