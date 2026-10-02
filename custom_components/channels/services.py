@@ -115,20 +115,22 @@ async def _async_sync_playback(call: ServiceCall) -> ServiceResponse:
         return {"error": str(err), "followers": {}}
 
     async def sync_one(entity_id: str) -> dict[str, object]:
-        if entity_id == leader_id:
-            return _skipped("It is the leader")
-        entry = async_get_app_entry(hass, entity_id)
-        if entry is None:
-            # Expected for a room listed ahead of its TV being added, so it
-            # gets its own status that callers can ignore.
-            return {"status": NOT_SET_UP}
-        if not is_loaded(entry):
-            # Disabled or mid-reload: not something a caller should ignore.
-            return _skipped(NOT_LOADED)
-        follower = entry.runtime_data.client
-        if not await wait_until_reachable(follower, timeout, clock):
-            return _skipped("Channels did not answer on that TV")
+        # Nothing done for one follower may escape: gather would drop every
+        # other follower's result with it.
         try:
+            if entity_id == leader_id:
+                return _skipped("It is the leader")
+            entry = async_get_app_entry(hass, entity_id)
+            if entry is None:
+                # Expected for a room listed ahead of its TV being added, so it
+                # gets its own status that callers can ignore.
+                return {"status": NOT_SET_UP}
+            if not is_loaded(entry):
+                # Disabled or mid-reload: not something a caller should ignore.
+                return _skipped(NOT_LOADED)
+            follower = entry.runtime_data.client
+            if not await wait_until_reachable(follower, timeout, clock):
+                return _skipped("Channels did not answer on that TV")
             result = await sync_follower(
                 leader,
                 follower,
@@ -137,14 +139,13 @@ async def _async_sync_playback(call: ServiceCall) -> ServiceResponse:
                 # A positive offset delays that TV, so aim it behind the leader.
                 target=-entry.options.get(CONF_SYNC_OFFSET_MS, 0) / 1000,
             )
+            await entry.runtime_data.async_request_refresh()
+            return result.as_dict()
         except ChannelsError as err:
             return _skipped(str(err))
         except Exception:
-            # One follower's bug must not take the others' results with it.
             _LOGGER.exception("Unexpected error syncing %s", entity_id)
             return _skipped(UNEXPECTED_ERROR)
-        await entry.runtime_data.async_request_refresh()
-        return result.as_dict()
 
     followers: list[str] = list(dict.fromkeys(call.data[ATTR_FOLLOWERS]))
     results = await asyncio.gather(*(sync_one(entity_id) for entity_id in followers))
@@ -175,6 +176,9 @@ async def _async_switch_one(
             status = await coordinator.client.status()
         except ChannelsError as err:
             return {**failed, "error": str(err)}
+        except Exception:
+            _LOGGER.exception("Unexpected error reading %s", entry.title)
+            return {**failed, "error": UNEXPECTED_ERROR}
         if status.recording_id is not None:
             return {**failed, "recording_id": status.recording_id, "error": None}
         return {**failed, "error": "No Channels DVR server is set up"}

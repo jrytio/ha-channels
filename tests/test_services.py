@@ -257,6 +257,27 @@ async def test_leader_that_is_not_a_channels_player_is_rejected(
         await sync_playback(hass, leader="media_player.apple_tv_office")
 
 
+async def test_unexpected_error_while_waiting_for_one_follower_does_not_stop_the_others(
+    hass, living_room_entry, office_entry, clients, engine
+):
+    _, reachable = engine
+    app_entry(hass, "Bedroom", "10.0.0.3")
+    clients["10.0.0.3"] = make_app_client()
+
+    async def reachable_unless_office(follower, max_wait, clock):
+        if follower is clients["10.0.0.2"]:
+            raise RuntimeError("malformed reply")
+        return True
+
+    reachable.side_effect = reachable_unless_office
+    await setup_integration(hass)
+
+    response = await sync_playback(hass, followers=[OFFICE, BEDROOM])
+
+    assert response["followers"][OFFICE] == {"status": "skipped", "reason": UNEXPECTED}
+    assert response["followers"][BEDROOM]["status"] == "synced"
+
+
 async def switch(hass, **data):
     return await hass.services.async_call(
         DOMAIN,
@@ -601,3 +622,21 @@ async def test_seek_forward_and_backward(hass, office_entry, clients):
 
     clients["10.0.0.2"].seek_forward.assert_awaited_once()
     clients["10.0.0.2"].seek_backward.assert_awaited_once()
+
+
+async def test_switch_status_read_failing_unexpectedly_loses_no_other_tvs_result(
+    hass, living_room_entry, office_entry, clients
+):
+    await setup_integration(hass)
+    clients["10.0.0.1"].status.side_effect = RuntimeError("malformed reply")
+
+    response = await switch(hass, **{ATTR_ENTITY_ID: [LIVING_ROOM, OFFICE]})
+
+    assert response[LIVING_ROOM]["error"] == UNEXPECTED
+    assert response[LIVING_ROOM]["switched"] is False
+    assert response[OFFICE] == {
+        "recording_id": "15017",
+        "switched": False,
+        "started_recording": False,
+        "error": None,
+    }
