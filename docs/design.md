@@ -288,7 +288,10 @@ helper gives up.
   `_channels_dvr._tcp.local.` (the server). Each discovery offers a confirm
   step where the name can be edited.
 - **Manual entry** of host and port for either type, as a fallback.
-- One config entry per TV and one per server.
+- One config entry per TV and one per server. Only one DVR server is
+  supported: a second, different one is aborted as `single_dvr_only`, after
+  the unique-ID check so the same server rediscovered at a new address still
+  updates its host.
 - **Unique ID:** the kind and the Bonjour host name, lower-cased
   (`app_office.local`, `dvr_dvr-nas6.local`). The stored host is the IP
   address from discovery, updated when a rediscovery shows it has changed. A

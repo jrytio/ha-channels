@@ -30,7 +30,8 @@ first. The built-in integration's YAML setup is not supported.
    `https://github.com/jrytio/ha-channels` with the type **Integration**.
 2. Install **Channels** and restart Home Assistant.
 3. Open Channels on each TV. Each one, and the DVR server, appears under
-   **Settings → Devices & services → Discovered**.
+   **Settings → Devices & services → Discovered**. One DVR server is
+   supported; a second is refused until the first is removed.
 
 ## Actions
 

@@ -12,6 +12,7 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.core import callback
+from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
     NumberSelector,
@@ -84,6 +85,17 @@ class ChannelsConfigFlow(ConfigFlow, domain=DOMAIN):
             return False
         return True
 
+    def _abort_if_another_dvr(self, kind: str) -> None:
+        """Abort when a DVR server is wanted and a different one exists.
+
+        Only one server is supported: the sync actions use a single server's
+        recordings and jobs.
+        """
+        if kind == KIND_DVR and any(
+            entry.data[CONF_KIND] == KIND_DVR for entry in self._async_current_entries()
+        ):
+            raise AbortFlow("single_dvr_only")
+
     async def async_step_zeroconf(
         self, discovery_info: ZeroconfServiceInfo
     ) -> ConfigFlowResult:
@@ -97,6 +109,7 @@ class ChannelsConfigFlow(ConfigFlow, domain=DOMAIN):
         self._abort_if_unique_id_configured(updates={CONF_HOST: host, CONF_PORT: port})
         # A device added by hand is keyed by the address that was typed in.
         self._async_abort_entries_match({CONF_KIND: kind, CONF_HOST: host})
+        self._abort_if_another_dvr(kind)
 
         if not await self._async_can_connect(kind, host, port):
             return self.async_abort(reason="cannot_connect")
@@ -146,6 +159,7 @@ class ChannelsConfigFlow(ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(unique_id_for(kind, host))
             self._abort_if_unique_id_configured()
             self._async_abort_entries_match({CONF_KIND: kind, CONF_HOST: host})
+            self._abort_if_another_dvr(kind)
             if await self._async_can_connect(kind, host, port):
                 return self.async_create_entry(
                     title=user_input[CONF_NAME],

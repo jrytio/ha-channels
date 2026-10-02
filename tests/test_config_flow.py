@@ -240,3 +240,59 @@ async def test_app_options_set_the_sync_offset(hass, office_entry):
 async def test_only_apps_have_options(hass, office_entry, dvr_entry):
     assert ChannelsConfigFlow.async_supports_options_flow(office_entry) is True
     assert ChannelsConfigFlow.async_supports_options_flow(dvr_entry) is False
+
+
+OTHER_DVR_FOUND = ZeroconfServiceInfo(
+    ip_address=ip_address("10.0.0.10"),
+    ip_addresses=[ip_address("10.0.0.10")],
+    port=8089,
+    hostname="dvr-other.local.",
+    type="_channels_dvr._tcp.local.",
+    name="other._channels_dvr._tcp.local.",
+    properties={},
+)
+
+
+async def test_a_second_discovered_dvr_server_is_refused(hass, dvr_entry):
+    result = await discover(hass, OTHER_DVR_FOUND)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "single_dvr_only"
+
+
+async def test_a_second_dvr_server_entered_by_hand_is_refused(hass, dvr_entry):
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_KIND: KIND_DVR, CONF_NAME: "Second", CONF_HOST: "10.0.0.10"},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "single_dvr_only"
+
+
+async def test_the_same_dvr_server_at_a_new_address_updates_its_host(hass, dvr_entry):
+    moved = ZeroconfServiceInfo(
+        ip_address=ip_address("10.0.0.77"),
+        ip_addresses=[ip_address("10.0.0.77")],
+        port=8089,
+        hostname="dvr-nas6.local.",
+        type="_channels_dvr._tcp.local.",
+        name="nas6._channels_dvr._tcp.local.",
+        properties={},
+    )
+
+    result = await discover(hass, moved)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert dvr_entry.data[CONF_HOST] == "10.0.0.77"
+
+
+async def test_an_app_can_be_added_while_a_dvr_server_exists(hass, dvr_entry):
+    result = await discover(hass, APP_FOUND)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "confirm"

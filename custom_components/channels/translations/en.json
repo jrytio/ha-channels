@@ -29,7 +29,8 @@
     },
     "abort": {
       "already_configured": "This device is already set up.",
-      "cannot_connect": "It did not answer."
+      "cannot_connect": "It did not answer.",
+      "single_dvr_only": "Only one Channels DVR server can be set up. Remove the existing one first."
     }
   },
   "options": {

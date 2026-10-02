@@ -11,7 +11,10 @@ from .lib import DvrClient
 
 
 def async_get_dvr_client(hass: HomeAssistant) -> DvrClient | None:
-    """Return the client of the first loaded DVR server entry, if any."""
+    """Return the client of the loaded DVR server entry, if any.
+
+    The config flow guarantees at most one DVR server entry.
+    """
     for entry in hass.config_entries.async_loaded_entries(DOMAIN):
         if entry.data[CONF_KIND] == KIND_DVR:
             return entry.runtime_data
