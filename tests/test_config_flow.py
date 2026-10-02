@@ -2,10 +2,11 @@
 
 from ipaddress import ip_address
 
-from homeassistant.config_entries import SOURCE_USER, SOURCE_ZEROCONF
+from homeassistant.config_entries import SOURCE_IGNORE, SOURCE_USER, SOURCE_ZEROCONF
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.channels.config_flow import ChannelsConfigFlow
 from custom_components.channels.const import (
@@ -296,3 +297,35 @@ async def test_an_app_can_be_added_while_a_dvr_server_exists(hass, dvr_entry):
 
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "confirm"
+
+
+def add_ignored_entry(hass):
+    entry = MockConfigEntry(
+        domain=DOMAIN, source=SOURCE_IGNORE, data={}, unique_id="app_den.local"
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+async def test_an_ignored_entry_does_not_break_dvr_discovery(hass):
+    add_ignored_entry(hass)
+
+    result = await discover(hass, DVR_FOUND)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "confirm"
+
+
+async def test_an_ignored_entry_does_not_break_app_discovery(hass):
+    add_ignored_entry(hass)
+
+    result = await discover(hass, APP_FOUND)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "confirm"
+
+
+async def test_an_ignored_entry_has_no_options(hass):
+    entry = add_ignored_entry(hass)
+
+    assert ChannelsConfigFlow.async_supports_options_flow(entry) is False

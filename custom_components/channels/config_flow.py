@@ -92,7 +92,8 @@ class ChannelsConfigFlow(ConfigFlow, domain=DOMAIN):
         recordings and jobs.
         """
         if kind == KIND_DVR and any(
-            entry.data[CONF_KIND] == KIND_DVR for entry in self._async_current_entries()
+            entry.data.get(CONF_KIND) == KIND_DVR
+            for entry in self._async_current_entries()
         ):
             raise AbortFlow("single_dvr_only")
 
@@ -201,7 +202,8 @@ class ChannelsConfigFlow(ConfigFlow, domain=DOMAIN):
     @callback
     def async_supports_options_flow(cls, config_entry: ConfigEntry) -> bool:
         """Only apps have options; a server has nothing to tune."""
-        return config_entry.data[CONF_KIND] == KIND_APP
+        # An ignored entry has no data, and no options.
+        return config_entry.data.get(CONF_KIND) == KIND_APP
 
 
 class ChannelsOptionsFlow(OptionsFlow):
