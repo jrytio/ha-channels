@@ -220,8 +220,15 @@ class ChannelsMediaPlayer(CoordinatorEntity[ChannelsAppCoordinator], MediaPlayer
         await self._run(self.coordinator.client.skip_backward())
 
     async def async_mute_volume(self, mute: bool) -> None:
-        """Mute or unmute. The app only has a toggle, so check first."""
-        if self._status is not None and self._status.muted != mute:
+        """Mute or unmute. The app only has a toggle, so read it fresh first.
+
+        The cached status can be seconds old, and the remote may have changed it.
+        """
+        try:
+            status = await self.coordinator.client.status()
+        except ChannelsError as err:
+            raise HomeAssistantError(str(err)) from err
+        if status.muted != mute:
             await self._run(self.coordinator.client.toggle_mute())
 
     async def async_media_seek(self, position: float) -> None:

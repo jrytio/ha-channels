@@ -28,6 +28,7 @@ from .fixtures import (
     FAVORITE_CHANNELS,
     STATUS_IN_PROGRESS,
     STATUS_LIVE,
+    STATUS_RECORDING,
     STATUS_STOPPED,
 )
 
@@ -207,6 +208,39 @@ async def test_mute_only_toggles_when_the_state_differs(hass, office_entry, clie
 
     await call(hass, MP_DOMAIN, "volume_mute", **{ATTR_MEDIA_VOLUME_MUTED: True})
     client.toggle_mute.assert_awaited_once()
+
+
+async def test_mute_is_decided_from_a_fresh_read_not_the_cached_state(
+    hass, office_entry, client
+):
+    await setup_integration(hass)
+    # Muted with the remote since the last poll.
+    client.status.return_value = status_of({**STATUS_RECORDING, "muted": True})
+
+    await call(hass, MP_DOMAIN, "volume_mute", **{ATTR_MEDIA_VOLUME_MUTED: True})
+
+    client.toggle_mute.assert_not_awaited()
+
+
+async def test_mute_toggles_once_when_the_fresh_read_is_unmuted(
+    hass, office_entry, client
+):
+    await setup_integration(hass)
+    client.status.return_value = status_of({**STATUS_RECORDING, "muted": False})
+
+    await call(hass, MP_DOMAIN, "volume_mute", **{ATTR_MEDIA_VOLUME_MUTED: True})
+
+    client.toggle_mute.assert_awaited_once()
+
+
+async def test_mute_fails_when_the_fresh_read_fails(hass, office_entry, client):
+    await setup_integration(hass)
+    client.status.side_effect = ChannelsConnectionError("The app did not answer")
+
+    with pytest.raises(HomeAssistantError, match="did not answer"):
+        await call(hass, MP_DOMAIN, "volume_mute", **{ATTR_MEDIA_VOLUME_MUTED: True})
+
+    client.toggle_mute.assert_not_awaited()
 
 
 async def test_seek_to_a_position_becomes_a_relative_seek(hass, office_entry, client):
