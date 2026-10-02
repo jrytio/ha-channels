@@ -1,0 +1,112 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Add a Channels device",
+        "description": "Channels apps and DVR servers are normally found automatically. Enter one by hand only if it was not.",
+        "data": {
+          "kind": "Type",
+          "name": "Name",
+          "host": "Host",
+          "port": "Port"
+        },
+        "data_description": {
+          "host": "The IP address or host name of the TV or server.",
+          "port": "Leave empty for the default: 57000 for an app, 8089 for a server."
+        }
+      },
+      "confirm": {
+        "title": "Channels found",
+        "description": "Add the Channels device at {host}?",
+        "data": {
+          "name": "Name"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "It did not answer. A Channels app only answers while it is open and in front on its TV."
+    },
+    "abort": {
+      "already_configured": "This device is already set up.",
+      "cannot_connect": "It did not answer."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Channels app options",
+        "data": {
+          "sync_offset_ms": "Sync offset"
+        },
+        "data_description": {
+          "sync_offset_ms": "Positive values make this TV play later than the leader when syncing; negative values make it play earlier."
+        }
+      }
+    }
+  },
+  "selector": {
+    "kind": {
+      "options": {
+        "app": "Channels app on a TV",
+        "dvr": "Channels DVR server"
+      }
+    }
+  },
+  "services": {
+    "sync_playback": {
+      "name": "Sync playback",
+      "description": "Puts follower TVs on the recording the leader is playing, at the leader's position.",
+      "fields": {
+        "leader": {
+          "name": "Leader",
+          "description": "The Channels player to copy. It must be playing or paused on a recording."
+        },
+        "followers": {
+          "name": "Followers",
+          "description": "The Channels players to bring in line with the leader."
+        },
+        "follower_timeout": {
+          "name": "Follower timeout",
+          "description": "How long to wait for each follower's Channels app to answer."
+        },
+        "tolerance_ms": {
+          "name": "Tolerance",
+          "description": "How close to the leader a follower must end up to count as synced."
+        }
+      }
+    },
+    "switch_to_recording": {
+      "name": "Switch to recording",
+      "description": "Moves a TV that is on live TV onto the recording of the same programme, starting a recording if there is none.",
+      "fields": {
+        "entity_id": {
+          "name": "Players",
+          "description": "The Channels players to move onto a recording."
+        },
+        "behind_live": {
+          "name": "Behind live",
+          "description": "How far behind the live edge to land."
+        }
+      }
+    },
+    "seek_by": {
+      "name": "Seek by",
+      "description": "Seeks forwards or backwards by a number of seconds.",
+      "fields": {
+        "seconds": {
+          "name": "Seconds",
+          "description": "Seconds to seek; negative seeks backwards."
+        }
+      }
+    },
+    "seek_forward": {
+      "name": "Seek forward",
+      "description": "Seeks ahead by the amount set in the Channels app."
+    },
+    "seek_backward": {
+      "name": "Seek backward",
+      "description": "Seeks back by the amount set in the Channels app."
+    }
+  }
+}

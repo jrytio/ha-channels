@@ -1,0 +1,73 @@
+sync_playback:
+  fields:
+    leader:
+      required: true
+      selector:
+        entity:
+          integration: channels
+          domain: media_player
+    followers:
+      required: true
+      selector:
+        entity:
+          integration: channels
+          domain: media_player
+          multiple: true
+    follower_timeout:
+      default: 30
+      selector:
+        number:
+          min: 0
+          max: 120
+          unit_of_measurement: seconds
+    tolerance_ms:
+      default: 50
+      selector:
+        number:
+          min: 50
+          max: 1000
+          unit_of_measurement: ms
+
+switch_to_recording:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          integration: channels
+          domain: media_player
+          multiple: true
+    behind_live:
+      default: 5
+      selector:
+        number:
+          min: 3
+          max: 60
+          unit_of_measurement: seconds
+
+seek_by:
+  target:
+    entity:
+      integration: channels
+      domain: media_player
+  fields:
+    seconds:
+      required: true
+      selector:
+        number:
+          min: -3600
+          max: 3600
+          step: 0.1
+          unit_of_measurement: seconds
+
+seek_forward:
+  target:
+    entity:
+      integration: channels
+      domain: media_player
+
+seek_backward:
+  target:
+    entity:
+      integration: channels
+      domain: media_player
