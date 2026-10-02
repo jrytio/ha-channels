@@ -437,7 +437,7 @@ The response lists every follower with one of these statuses:
 - `skipped` — with a `reason`: the API never answered, the follower never
   started the recording, it is the leader, the leader stopped part-way, the
   leader changed recording, the leader kept pausing and resuming, the
-  follower stopped reporting a position, a connection error, the follower's
+  follower left the recording, the follower stopped reporting a position, a connection error, the follower's
   Channels config entry is not loaded, or an unexpected error (logged)
 - `not_set_up` — there is no Channels media player by that ID. Kept apart
   from `skipped` so a caller can list a room ahead of its TV existing and

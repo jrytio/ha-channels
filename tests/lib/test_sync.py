@@ -280,6 +280,37 @@ async def test_leader_changing_recording_mid_sync_is_an_error(clock, leader):
         await sync_follower(leader, follower, clock=clock)
 
 
+LEFT_REASON = "It left the recording during the sync"
+
+
+@pytest.mark.parametrize("destination", ["recording", "live"])
+async def test_follower_leaving_the_recording_mid_sync_is_skipped_and_left_alone(
+    clock, leader, destination
+):
+    follower = SimPlayer(clock)
+    follower.watch_recording(REC, 300.0)
+    original_seek = follower.seek
+    calls_at_switch = []
+
+    async def seek_then_follower_leaves(seconds):
+        status = await original_seek(seconds)
+        if destination == "recording":
+            follower.watch_recording("15099", 40.0)
+        else:
+            follower.watch_live("101")
+        calls_at_switch.append(list(follower.calls))
+        return status
+
+    follower.seek = seek_then_follower_leaves
+
+    result = await sync_follower(leader, follower, clock=clock)
+
+    assert result.status == SKIPPED
+    assert result.reason == LEFT_REASON
+    assert len(calls_at_switch) == 1
+    assert follower.calls == calls_at_switch[0]
+
+
 async def test_sample_times_that_differ_are_corrected_for(clock):
     leader = SimPlayer(clock, latency=0.004)
     leader.watch_recording(REC, 500.0)

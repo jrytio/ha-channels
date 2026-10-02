@@ -38,6 +38,10 @@ class LeaderError(ChannelsError):
     """The leader cannot be synced to."""
 
 
+class _FollowerLeft(Exception):
+    """The follower is no longer on the recording the sync started on."""
+
+
 class Player(Protocol):
     """The parts of AppClient the engine uses."""
 
@@ -126,12 +130,15 @@ async def _match_play_state(
     """Put the follower in the leader's play state and return the leader's status.
 
     A paused side has a frozen clock, so this runs whenever the leader may have
-    changed. Raises LeaderError if the leader left the recording being synced.
+    changed. Raises LeaderError if the leader left the recording being synced,
+    and _FollowerLeft if the follower did.
     """
     lead = await leader_status(leader)
     if lead.recording_id != recording_id:
         raise LeaderError("The leader changed to a different recording during the sync")
     follow = await follower.status()
+    if follow.recording_id != recording_id:
+        raise _FollowerLeft
     if lead.state == STATE_PLAYING and follow.state == STATE_PAUSED:
         await follower.resume()
     elif lead.state == STATE_PAUSED and follow.state == STATE_PLAYING:
@@ -180,6 +187,21 @@ async def sync_follower(
 
     recording_id = lead.recording_id
 
+    try:
+        return await _correct(leader, follower, recording_id, clock, tolerance, target)
+    except _FollowerLeft:
+        return SyncResult(SKIPPED, reason="It left the recording during the sync")
+
+
+async def _correct(
+    leader: Player,
+    follower: Player,
+    recording_id: str,
+    clock: Clock,
+    tolerance: float,
+    target: float,
+) -> SyncResult:
+    """Measure and correct the follower until it is in tolerance or rounds run out."""
     offset: float | None = None
     corrections = 0
     for attempt in range(1, MAX_ROUNDS + 2):

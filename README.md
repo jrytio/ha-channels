@@ -61,8 +61,8 @@ Each follower gets one of four statuses:
 - `out_of_tolerance`: it was brought as close as five corrections allowed,
   but not within `tolerance_ms`.
 - `skipped`: it was not synced; `reason` says why (it never answered, it is
-  the leader, its Channels entry is not loaded, the leader stopped, and so
-  on).
+  the leader, its Channels entry is not loaded, the leader stopped, it left the
+  recording, and so on).
 - `not_set_up`: no Channels media player exists by that entity ID. A script
   can list a room ahead of its TV being added and ignore this status.
 
