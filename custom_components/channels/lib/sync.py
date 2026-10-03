@@ -119,9 +119,14 @@ async def measure_offset(
 async def _hold(player: Player, seconds: float, clock: Clock) -> None:
     """Pause for a measured time, counting the pause call's own latency."""
     started = clock.time()
-    await player.pause()
-    await clock.sleep(max(0.0, seconds - (clock.time() - started)))
-    await player.resume()
+    try:
+        await player.pause()
+        await clock.sleep(max(0.0, seconds - (clock.time() - started)))
+    finally:
+        # Even when cancelled mid-hold, and even if cancelled again while
+        # resuming, the TV must not be left paused. A resume on a player that
+        # is already playing does nothing.
+        await asyncio.shield(player.resume())
 
 
 async def _match_play_state(

@@ -44,6 +44,7 @@ NO_DVR = (
     "The leader is on live TV and no Channels DVR server is set up, "
     "so the other TVs cannot follow it"
 )
+UNEXPECTED = "An unexpected error occurred; see the log"
 WILL_NOT_SETTLE = "It could not be kept in step with the leader; trying again shortly"
 
 
@@ -51,6 +52,27 @@ class LeaderApp(Player, Protocol):
     """The parts of AppClient the session uses on the leader."""
 
     async def toggle_record(self) -> AppStatus: ...
+
+
+class _GuardedLeader:
+    """The leader as a fine-tune sees it: a reading is only good if followable.
+
+    A leader that reaches the end of its recording mid-tune reports position 0;
+    without this the tune would drag the follower to the start.
+    """
+
+    def __init__(self, leader: Player) -> None:
+        self._leader = leader
+        self.play_recording = leader.play_recording
+        self.seek = leader.seek
+        self.pause = leader.pause
+        self.resume = leader.resume
+
+    async def status(self) -> AppStatus:
+        reading = await self._leader.status()
+        if not _followable(reading):
+            raise LeaderError("The leader is no longer playing a recording")
+        return reading
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +163,8 @@ class FollowSession:
         self._epoch = 0
         self._previous: AppStatus | None = None
         self._live: _Live | None = None
+        self._no_dvr_told = False  # NO_DVR has been reported this visit to live TV
+        self._guarded_leader = _GuardedLeader(leader)
 
     async def run(self) -> None:
         """Run until cancelled."""
@@ -165,7 +189,8 @@ class FollowSession:
         try:
             status = await self._leader.status()
         except ChannelsError:
-            self._live = None
+            # An unreadable leader says nothing about what it is on, so what is
+            # known about its live channel stays.
             self._publish(None)
             return
         on_live = (
@@ -178,6 +203,7 @@ class FollowSession:
             await self._handle_live(status.channel_number)
             return
         self._live = None
+        self._no_dvr_told = False
         self._publish(status if _followable(status) else None)
 
     def _publish(self, sample: AppStatus | None) -> None:
@@ -212,7 +238,14 @@ class FollowSession:
         if live.gave_up:
             return
         if self._dvr is None:
-            self._give_up(live, NO_DVR)
+            # Once per visit to live TV, and only when the leader has stayed.
+            if (
+                not first_look
+                and not self._no_dvr_told
+                and self._clock.time() - live.since >= self._live_settle
+            ):
+                self._no_dvr_told = True
+                self._problem(None, NO_DVR)
             return
         try:
             if first_look:
@@ -237,6 +270,9 @@ class FollowSession:
             # No second try until the leader changes channel: a retry could
             # send the record toggle again.
             self._give_up(live, str(err))
+        except Exception:
+            _LOGGER.exception("Unexpected error moving the leader to a recording")
+            self._give_up(live, UNEXPECTED)
 
     def _give_up(self, live: _Live, message: str) -> None:
         live.gave_up = True
@@ -263,7 +299,7 @@ class FollowSession:
                 self._failed(name, memory)
             except Exception:
                 _LOGGER.exception("Unexpected error following on %s", name)
-                self._rest(name, memory)
+                self._rest(name, memory, UNEXPECTED)
 
     async def _step(
         self, name: str, follower: Follower, memory: _Memory, lead: AppStatus | None
@@ -318,8 +354,14 @@ class FollowSession:
         if lead.state == STATE_PAUSED:
             if abs(error) > PAUSED_SLACK:
                 self._set_status(name, CORRECTING)
+                if memory.jumped_in == self._epoch:
+                    # Same as a playing jump: the last seek did not get it
+                    # there and the leader has not moved since.
+                    self._failed(name, memory)
+                memory.jumped_in = self._epoch
                 await player.seek(-error)
             else:
+                memory.jumped_in = None
                 self._set_status(name, IN_SYNC)
             return
 
@@ -355,7 +397,7 @@ class FollowSession:
         epoch = self._epoch
         try:
             result = await sync_follower(
-                self._leader,
+                self._guarded_leader,
                 player,
                 clock=self._clock,
                 tolerance=FINE_TOLERANCE,
@@ -378,22 +420,28 @@ class FollowSession:
         if memory.failures >= REST_AFTER:
             self._rest(name, memory)
 
-    def _rest(self, name: str, memory: _Memory) -> None:
+    def _rest(self, name: str, memory: _Memory, message: str = WILL_NOT_SETTLE) -> None:
         memory.failures = 0
         memory.out_of_line = 0
         memory.jumped_in = None
         memory.tighten = False
         memory.rest_until = self._clock.time() + REST_FOR
         self._set_status(name, RESTING)
-        self._problem(name, WILL_NOT_SETTLE)
+        self._problem(name, message)
 
     def _set_status(self, name: str, status: str) -> None:
         if self.statuses[name] == status:
             return
         self.statuses[name] = status
         if self._on_status is not None:
-            self._on_status(name, status)
+            try:
+                self._on_status(name, status)
+            except Exception:
+                _LOGGER.exception("The status callback failed")
 
     def _problem(self, follower: str | None, message: str) -> None:
         if self._on_problem is not None:
-            self._on_problem(follower, message)
+            try:
+                self._on_problem(follower, message)
+            except Exception:
+                _LOGGER.exception("The problem callback failed")
