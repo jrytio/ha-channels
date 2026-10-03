@@ -8,6 +8,6 @@
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/jrytio/ha-channels/issues",
   "requirements": [],
-  "version": "0.1.1",
+  "version": "0.2.0",
   "zeroconf": ["_channels_app._tcp.local.", "_channels_dvr._tcp.local."]
 }

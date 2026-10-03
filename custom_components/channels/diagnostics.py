@@ -11,6 +11,7 @@ from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
 
 from .const import CONF_KIND, KIND_APP
+from .follow import follow_diagnostics
 from .helpers import is_loaded
 from .lib import ChannelsError
 
@@ -37,6 +38,7 @@ async def async_get_config_entry_diagnostics(
         info["status"] = (
             async_redact_data(asdict(status), TO_REDACT_STATUS) if status else None
         )
+        info["follow_session"] = follow_diagnostics(hass, entry.entry_id) or None
         return info
     try:
         reported = await entry.runtime_data.status()

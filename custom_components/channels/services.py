@@ -15,7 +15,7 @@ from homeassistant.core import (
     SupportsResponse,
     callback,
 )
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, service
 import probatio as vol
 
@@ -24,6 +24,7 @@ from .const import (
     ATTR_FOLLOWER_TIMEOUT,
     ATTR_FOLLOWERS,
     ATTR_LEADER,
+    ATTR_LIVE_SETTLE,
     ATTR_SECONDS,
     ATTR_TOLERANCE_MS,
     CONF_SYNC_OFFSET_MS,
@@ -31,8 +32,16 @@ from .const import (
     SERVICE_SEEK_BACKWARD,
     SERVICE_SEEK_BY,
     SERVICE_SEEK_FORWARD,
+    SERVICE_START_FOLLOW,
+    SERVICE_STOP_FOLLOW,
     SERVICE_SWITCH_TO_RECORDING,
     SERVICE_SYNC_PLAYBACK,
+)
+from .follow import (
+    async_is_leading,
+    async_leader_of,
+    async_start_follow,
+    async_stop_follow,
 )
 from .helpers import async_get_app_entry, async_get_dvr_client, is_loaded
 from .lib import (
@@ -67,6 +76,25 @@ SWITCH_TO_RECORDING_SCHEMA = vol.Schema(
         ),
     }
 )
+
+START_FOLLOW_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_LEADER): cv.entity_id,
+        vol.Required(ATTR_FOLLOWERS): vol.All(cv.ensure_list, [cv.entity_id]),
+        # Above 900 ms a follower would be jumped before it was ever fine-tuned.
+        vol.Optional(ATTR_TOLERANCE_MS, default=250): vol.All(
+            vol.Coerce(float), vol.Range(min=100, max=900)
+        ),
+        vol.Optional(ATTR_LIVE_SETTLE, default=10): vol.All(
+            vol.Coerce(float), vol.Range(min=0, max=300)
+        ),
+        vol.Optional(ATTR_BEHIND_LIVE, default=5): vol.All(
+            vol.Coerce(float), vol.Range(min=MIN_BEHIND_LIVE, max=60)
+        ),
+    }
+)
+
+STOP_FOLLOW_SCHEMA = vol.Schema({vol.Required(ATTR_LEADER): cv.entity_id})
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -238,9 +266,89 @@ async def _async_switch_to_recording(call: ServiceCall) -> ServiceResponse:
     return results
 
 
+def _leader_entry(hass: HomeAssistant, leader_id: str) -> ConfigEntry:
+    entry = async_get_app_entry(hass, leader_id)
+    if entry is None:
+        raise ServiceValidationError(f"{leader_id} is not a Channels media player")
+    return entry
+
+
+async def _async_start_follow(call: ServiceCall) -> None:
+    """Start keeping the followers on the leader's recording and position."""
+    hass = call.hass
+    leader_id: str = call.data[ATTR_LEADER]
+    leader_entry = _leader_entry(hass, leader_id)
+    if not is_loaded(leader_entry):
+        raise HomeAssistantError("The leader's Channels entry is not loaded")
+    # Two sessions pulling one TV two ways would never settle.
+    if (other := async_leader_of(hass, leader_id)) is not None:
+        raise ServiceValidationError(f"{leader_id} is itself following {other}")
+
+    followers: dict[str, ConfigEntry] = {}
+    missing: list[str] = []
+    for entity_id in dict.fromkeys(call.data[ATTR_FOLLOWERS]):
+        entry = async_get_app_entry(hass, entity_id)
+        # A room listed ahead of its TV being added is expected; skip it.
+        if entity_id == leader_id:
+            continue
+        if entry is None:
+            missing.append(entity_id)
+            continue
+        if (other := async_leader_of(hass, entity_id)) not in (None, leader_id):
+            raise ServiceValidationError(f"{entity_id} is already following {other}")
+        if async_is_leading(hass, entity_id):
+            raise ServiceValidationError(
+                f"{entity_id} is leading a follow session of its own"
+            )
+        followers[entity_id] = entry
+
+    if missing:
+        _LOGGER.warning(
+            "%s will not follow %s: no Channels player exists by that ID",
+            ", ".join(missing),
+            leader_id,
+        )
+    if not followers:
+        # Nobody to keep in line; a session would only move the leader for no one.
+        _LOGGER.info(
+            "No follow session was started for %s: no follower is left", leader_id
+        )
+        async_stop_follow(hass, leader_entry.entry_id)
+        return
+
+    async_start_follow(
+        hass,
+        leader_id,
+        leader_entry,
+        followers,
+        tolerance=call.data[ATTR_TOLERANCE_MS] / 1000,
+        live_settle=call.data[ATTR_LIVE_SETTLE],
+        behind_live=call.data[ATTR_BEHIND_LIVE],
+        switch_lock=_switch_lock(hass),
+    )
+
+
+async def _async_stop_follow(call: ServiceCall) -> None:
+    """End the leader's follow session, if it has one."""
+    entry = _leader_entry(call.hass, call.data[ATTR_LEADER])
+    async_stop_follow(call.hass, entry.entry_id)
+
+
 @callback
 def async_setup_services(hass: HomeAssistant) -> None:
     """Register the integration's actions."""
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_START_FOLLOW,
+        _async_start_follow,
+        schema=START_FOLLOW_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_STOP_FOLLOW,
+        _async_stop_follow,
+        schema=STOP_FOLLOW_SCHEMA,
+    )
     hass.services.async_register(
         DOMAIN,
         SERVICE_SYNC_PLAYBACK,

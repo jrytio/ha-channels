@@ -93,7 +93,9 @@ these.
   that was recording, did not stop that recording within 15 s (the app may
   have put a confirmation on screen). The DVR's web interface stops a
   recording with `DELETE /dvr/jobs/<id>`. The code still never sends the
-  toggle while a recording exists, since the API documents it as a toggle.
+  toggle while a recording exists for the channel that was checked, since
+  the API documents it as a toggle. (The app could change channel between
+  that check and the toggle arriving; see `switch_to_recording` below.)
 - The DVR's HTTP `Date` header ran 0.8 s behind the machine running the
   tests (1 s resolution).
 
@@ -149,6 +151,58 @@ loading, the paused keyframe seek and the job list described under Measured
 behaviour. The first two, and the job list as a guard for `toggle_record`,
 are handled as described below; the paused keyframe seek is a known limit.
 
+#### Follow session (2026-10-03)
+
+Run from a laptop with `scripts/bench.py follow` against a leader and one
+follower (both Apple TVs), with a third follower listed whose TV was off the
+network for the whole run, and the DVR server. Leader and follower actions
+were sent through the app API, which the session cannot tell from a remote.
+
+Reading noise, the follower lined up and nothing touched:
+
+| Run | Readings | Spread |
+| --- | --- | --- |
+| Watch only, 90 s | 15 | within 39 ms of the median; largest swing between consecutive readings 54 ms |
+| Session, 10 min unattended | 563 | standard deviation 18 ms; 11 beyond ±50 ms, 1 beyond ±100 ms (−102 ms), none beyond ±130 ms |
+
+The ten-minute session made no correction after the first, which followed a
+seek on the leader. The tolerance of 250 ms and the two-readings rule have
+room to spare.
+
+What the session did:
+
+| Action | Follower | In step (within 50 ms) again |
+| --- | --- | --- |
+| Leader paused | paused about 1 s later, 0.92 s from the leader's frame | held while paused |
+| Leader resumed | resumed about 1 s later | about 5 s |
+| Leader skipped +180 s | one plain seek, which landed 0.94 s short; then one fine-tune | about 5 s |
+| Leader rewound 30 s | one plain seek, then one fine-tune | about 4 s |
+| Leader skipped +30 s five times, 1 s apart | three plain seeks; no problem reported | 2 s after the last skip |
+| Leader played a different recording | started it, lined up | about 6 s |
+| Follower paused through its own app | resumed within about 1 s | about 5 s |
+| Follower seeked −20 s through its own app | pulled back within about 1 s | about 5 s |
+| Follower's TV asleep, leader skipped +90 s meanwhile, TV woken | nothing sent while asleep; came back paused on the recording, was resumed and seeked +115 s | about 8 s after its app answered |
+| Third follower, off the network throughout | `absent`; nothing sent | n/a |
+| Session interrupted during a hold | the resume was sent; the process ended 0.2 s after the interrupt; follower left playing | n/a |
+
+No plain seek had to be sent twice for one skip: a seek had landed by the
+next reading, 1 s later.
+
+Live TV:
+
+| Action | Result |
+| --- | --- |
+| Leader tuned to a channel that was not being recorded | no command for 9.8 s; then `toggle_record`, whose reply named the channel (`channel.number` present, `status: playing`, no recording); leader moved onto the new file 4 s later; follower on it and in step 21 s after the leader tuned |
+| Leader skipped +600 s on that in-progress file, far past the live edge | the leader reported the requested position, frozen, for about 2 s, then its real position at the edge; the follower was seeked by the same amount and both ended at the edge, in step, about 6 s after the skip; neither stalled |
+| Leader played a finished recording, then tuned to the same channel again while it was recording | moved onto the existing recording 0.2 s after tuning; no `toggle_record`; no second file |
+| Leader flipped through three channels, 4 s on each | no `toggle_record`; nothing sent to the follower |
+
+Two things could not be established from the laptop and are left for a
+person at the TV: whether pressing Home on a follower that is playing takes
+it out of the app (its API kept answering and it kept being followed, so it
+may have gone to picture-in-picture), and how a paused follower's keyframe
+seeks look on screen.
+
 ## The `channels` integration
 
 ### Repo and install
@@ -176,6 +230,8 @@ custom_components/channels/
     playback.py      # start a recording and wait until it is playing
     sync.py          # the sync engine
     recording.py     # live TV to recording
+    follow.py        # the follow session: keeps followers on a leader
+  follow.py          # running sessions, one per leader, as background tasks
 tests/
 ```
 
@@ -236,7 +292,13 @@ configured sync offset: a TV set to +80 ms is aimed 80 ms behind the leader.
    - **Leader paused:** seek the follower by the error. Nothing is moving, so
      a seek is the only tool.
    - **Follower ahead by 45 ms to 3 s:** pause the follower for the error
-     minus 45 ms, then resume.
+     minus 45 ms, then resume. Every resume that ends a hold goes through
+     `asyncio.shield`, the ordinary one and the one sent when the hold is
+     cancelled or fails, so a sync or a session stopped at any point in a
+     hold does not leave a TV paused. The
+     original exception always leaves the hold: a resume that fails then is
+     logged as a warning and never replaces a cancellation, which would
+     leave a session that could not be stopped.
    - **Anything else:** seek the follower to 1 s ahead of the leader, so the
      next round can pause.
 
@@ -386,7 +448,10 @@ For each player:
 
 1. Read status. Stopped: fail with "nothing is playing". Already on a
    recording: return it with `switched: false, started_recording: false`.
-   Neither on a recording nor on a live channel: fail.
+   Neither on a recording nor on a live channel: fail. A caller may pass
+   the `channel` it decided on (the follow session does; the action does
+   not): if the app is no longer live on that channel, raise
+   `ChannelChanged`, a `SwitchError`, before any DVR request.
 2. On live TV: ask the DVR for an in-progress recording on that channel.
    None listed: ask whether the DVR has an active job on the channel at the
    current time (`has_active_job`). If it has, a recording is running whose
@@ -394,15 +459,27 @@ For each player:
    for the file every 0.5 s for up to 10 s, and use it when it appears. If
    it never appears, fail with "The DVR is recording this channel but the
    recording has not appeared" and `started_recording: false`.
-3. No file and no active job: re-read the app's channel and fail if it has
-   changed, since
-   `toggle_record` on another channel could stop a recording there. Note the
-   latest failed job on the channel, then call `toggle_record` and poll the
+3. No file and no active job: note the latest failed job on the channel,
+   then re-read the app's channel and raise `ChannelChanged` ("The channel
+   changed before a recording could be started") if it has changed, since
+   `toggle_record` on another channel could stop a recording there. The
+   check and the toggle are adjacent, with no other request between them.
+   Then call `toggle_record`. Its reply is the app's status: if it shows
+   another channel, the toggle went there, and the switch fails with "The
+   channel changed as the recording was requested; the record command went
+   to channel N. Check the DVR" and `started_recording: true` (a recording
+   may have been started or stopped on that channel). A reply that names no
+   channel is not taken as evidence either way. Otherwise poll the
    DVR every 0.5 s for up to 10 s for the new file. A failed job newer than
    the one noted (judged on the DVR's own clock) ends the wait early with
    that job's error text. If neither a file nor a new failed job appears in
    10 s, fail with "A recording was requested but has not appeared; it may
    still be starting" and `started_recording: true`.
+
+   The window cannot be closed completely: the app could change channel
+   between the status read and the toggle arriving. Keeping the two
+   adjacent makes it one request long, and the toggle's reply detects a
+   miss after the fact.
 4. If the recording is younger than `behind_live`, wait on live TV until it
    is `behind_live` seconds old, so the TV can land that far back.
 5. Start the recording on the TV (see "Starting playback") and wait up to
@@ -472,9 +549,151 @@ is not loaded, `error` says so and `followers` is empty.
 entity actions kept from the built-in integration so this one is a drop-in
 replacement. `seek_by` accepts fractional seconds.
 
+**`channels.start_follow`** and **`channels.stop_follow`** — domain actions
+with no response. `start_follow` takes `leader`, `followers`, `tolerance_ms`
+(default 250, 100 to 900), `live_settle` (default 10 s, 0 to 300) and
+`behind_live` (default 5 s, 3 to 60), builds a `FollowSession` and runs it
+as a background task of the leader's config entry. A session for a leader
+that already has one replaces it. `stop_follow` takes `leader` and cancels
+its session. The session is given the switch action's lock, and the DVR as
+a function (`lambda: async_get_dvr_client(hass)`) so a DVR entry set up
+after the start is found.
+
+Followers with no entity registry entry, and the leader itself, are left
+out; those with no registry entry are logged as a warning, by name, and a
+call that leaves no follower is logged at info level. A follower already in
+another leader's session, a follower that is
+leading a session of its own, and a leader that is itself following, raise
+`ServiceValidationError`: two sessions pulling one TV two ways would never
+settle. If no follower is left after the leaving out, no session is started,
+the leader's existing session, if it has one, is ended, and nothing is
+raised.
+
+A done-callback on the session's task removes it from the registry if it ends
+by itself, logs its exception, and refreshes the attributes. It removes only
+its own entry, so a replaced session's late end cannot remove its successor.
+
+A follower's app is reached through its config entry each time, not through
+a client captured at start. While the entry is not loaded the follower is
+treated as not answering, and after a reload the new client is used.
+
+The session's problem callback fires the event `channels_follow_problem`
+(`leader`, `follower` or null, `message`). A follower's message is prefixed
+with its friendly name (`Office Channels: It could not ...`), or its entity
+ID when it has no state, so `message` alone says which TV; a leader's message
+is passed through. Its status callback sends a
+dispatcher signal; every Channels media player listens and rewrites its
+state, which is how `following`, `follow_status` and `followed_by` stay
+current between polls.
+
+### The follow session
+
+`lib/follow.py`. One task reads the leader every `TICK` (1 s) and publishes
+the reading. Each follower has its own task, woken by each new reading, so a
+follower in the middle of a several-second fine-tune does not delay the
+others.
+
+The leader's reading is published as "nothing to follow" when the app is
+unreachable, stopped, on live TV, or at position 0. Position 0 is where a
+recording that played to its end sits, reported as playing or paused;
+following it would drag every follower to the start. A recording just
+started from the beginning reports 0 too, for a second or two while it
+loads, and is followed as soon as it moves.
+
+On live TV the session looks at the DVR once when the channel is first seen.
+If the channel has a recording in progress or an active job, it calls
+`switch_to_recording` at once, under the lock the switch action uses. If
+not, it waits until the leader has been on that channel for `live_settle`
+and then calls it. It passes the channel it decided on, so a leader that has
+moved on by the time the switch reads it raises `ChannelChanged`: nothing is
+reported, the channel is not given up on, and the next reading shows the new
+channel and starts its settle time. Surfing past a recorded channel cannot
+start a recording on the next one without its wait.
+
+Once the move has begun it is allowed to finish even if the session is
+stopped: `switch_to_recording` runs as its own task, which acquires the lock
+itself, and the session awaits it through `asyncio.shield`. A cancel
+re-raises at once; the move runs to its end (well under a minute), the
+session keeps a reference to it so it is not garbage-collected, and a
+done-callback logs its result, or its error as a warning with the message.
+Stopped halfway it could leave a recording running with the leader still on
+live TV, or the leader on a recording far behind live.
+
+A failure is reported once and not retried until the leader changes channel
+or leaves live TV, since a retry could send the record toggle again. Any
+exception while moving the leader, not only a `ChannelsError` (other than
+`ChannelChanged`), ends the attempts for that channel; one that was not
+expected is reported with the `UNEXPECTED` message. A moment in which the
+leader cannot be read does not count as leaving live TV.
+
+The DVR client may be given as a client, None, or a function returning
+either; it is resolved once per look at live TV, not once per request, so a
+DVR set up after the session started is used from the next look. With no DVR
+client the session cannot move the leader. It reports that once per visit to
+live TV, and only after the leader has stayed on one channel for
+`live_settle`.
+
+Each follower pass makes at most one correction, the first of these that
+applies:
+
+1. Not answering: `absent`, nothing sent.
+2. Not on the leader's recording, reporting no position, or sitting at
+   position 0 while the leader is past 1 s: `start_playback`.
+3. Play state differs: pause or resume.
+4. Leader paused and the follower more than `PAUSED_SLACK` (1.5 s) out: a
+   plain seek. It is counted toward resting exactly like the playing jump in
+   rule 5: a seek that is needed again on the next pass, with the leader not
+   having moved, is a failed correction.
+5. More than `JUMP` (1 s) out: a plain seek by the difference.
+6. A coarse correction (2, a resume, or 5) was made last time, or the
+   follower has been outside the tolerance for `CONFIRM` (2) passes running:
+   `sync_follower` with a 50 ms tolerance.
+
+Where it should be is the leader's position, carried forward to the moment
+the follower was read, plus the follower's target offset.
+
+A fine-tune is given a guarded view of the leader that raises `LeaderError`
+when the leader's reading is not followable (stopped, live TV, position 0), so
+a leader that reaches the end of its recording mid-fine-tune cannot drag the
+follower to the start. A fine-tune takes its own readings of the leader; if
+the leader seeks mid-fine-tune the fine-tune follows it. It is abandoned only
+when the leader stops being followable or changes recording.
+
+Rule 6 fine-tunes after every coarse correction because a plain seek lands
+within a second, not within the tolerance; a fine-tune that finds the
+follower already close sends nothing. The two-pass rule exists because the
+fine-tune corrects to 50 ms: one stray reading must not cause a visible hop
+on a follower that is inside the tolerance.
+
+A failed correction is counted: a recording that will not start, a command
+that errors, a fine-tune that does not end synced, a plain seek that is
+still needed on the next pass. A success, which is being found in step
+(inside the tolerance while playing, inside `PAUSED_SLACK` while paused) or
+a fine-tune that ends synced, clears the count. After `REST_AFTER` (5) in a
+row the follower is left alone for `REST_FOR` (30 s), and the pass that
+rested it ends there: the seek it would have sent is not sent. Two kinds of
+failure are not counted when the leader has moved since: a fine-tune that
+did not end in step, and a plain seek needed again. A recording that will
+not start and a command that errors are counted regardless. The leader task
+tracks moving as an epoch that goes up on every change of recording, play
+state, or position beyond what playing accounts for, and when the leader
+goes between followable and nothing to follow. Someone pressing skip ten
+times is not a follower failing to keep up.
+
+A rested follower is reported ("It could not be kept in step ...") once per
+streak: after that problem, no other for that follower until it has been
+`in_sync` again. It is still rested each time. The count of passes out of
+line for rule 6 is reset when there is nothing to follow and while the
+leader is paused, so "two passes running" cannot span a gap or a pause.
+
+An unexpected exception in a follower's task rests the follower and is
+reported with the `UNEXPECTED` message, not the "could not be kept in step"
+one. The session's callbacks are called inside a guard: a callback that
+raises is logged and does not end the session.
+
 ### Errors
 
-The two actions above put operational failures in their response. Both
+The two sync actions above put operational failures in their response. Both
 raise `ServiceValidationError` for a target or leader that is not a Channels
 media player, and the schema rejects a field that is missing or out of range.
 The ordinary media player commands and the three seek actions raise
@@ -494,6 +713,15 @@ notification.
   `channels`.
 - **Clients:** mocked HTTP, using response bodies captured from the real
   devices on 2026-10-01.
+- **Follow session:** scenario tests against the same simulated players,
+  several at once, on a fake clock that parks each sleeping task and jumps
+  to the next wake time. The simulated player has remote-control actions
+  that are not logged as engine commands, so a test can say "someone
+  rewound the Office" and then assert what the session sent. The simulated
+  player does not model keyframe seeks while paused: a paused seek lands
+  exactly, so the paused tests do not cover a seek landing on a keyframe.
+  The simulated DVR can answer with a latency, for the tests of a channel
+  changing while the DVR is asked.
 - **HA layer:** `pytest-homeassistant-custom-component` for the config flow
   (zeroconf, manual, duplicate, IP change), entity state mapping, and action
   schemas and responses.

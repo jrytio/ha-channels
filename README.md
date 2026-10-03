@@ -13,6 +13,8 @@ Channels integration** while it is installed. The two cannot run side by side.
   ID of the recording being played.
 - **Syncs TVs**: puts other TVs on the recording one TV is playing, at the
   same position, typically within 50 ms.
+- **Keeps them synced**: holds other TVs to one TV for as long as you like,
+  through pauses, rewinds, commercial skips and changes of programme.
 - Moves a TV from live TV onto the recording of the same programme, starting
   a recording if there is none.
 
@@ -109,6 +111,123 @@ Both actions report operational failures in `error`, so a script can read
 the reason. They raise only for invalid input: a target or leader that is not
 a Channels media player, or a field out of range.
 
+### `channels.start_follow` and `channels.stop_follow`
+
+`sync_playback` lines TVs up once. `start_follow` keeps them lined up: it
+starts a follow session that runs until `stop_follow`, a restart of Home
+Assistant, or the leader's entry being unloaded or reloaded (a reload
+happens, for example, when discovery updates the TV's address).
+
+| Field | Default | |
+| --- | --- | --- |
+| `leader` | required | The Channels player the others are held to |
+| `followers` | required | The Channels players to keep in line. One that does not exist yet is ignored |
+| `tolerance_ms` | 250 | How far out a playing follower may be before it is corrected. 100 to 900 |
+| `live_settle` | 10 | Seconds the leader must stay on an unrecorded live channel before it is recorded. 0 to 300 |
+| `behind_live` | 5 | Seconds behind live the leader lands when moved onto a recording. 3 to 60 |
+
+```yaml
+action: channels.start_follow
+data:
+  leader: media_player.channels_living_room
+  followers:
+    - media_player.channels_office
+    - media_player.channels_back_yard
+```
+
+```yaml
+action: channels.stop_follow
+data:
+  leader: media_player.channels_living_room
+```
+
+Once a second the session reads the leader and each follower, and corrects
+any follower that is out of line. It does not matter why: a skip on the
+leader, a rewind with the follower's own remote and plain drift are treated
+alike.
+
+- A follower that is not answering (another app in front, TV off) is left
+  alone, and picked up again when Channels is back in front on it. The
+  session never wakes a TV or opens the app; do that before starting it.
+- A follower more than a second out is seeked at once and then fine-tuned to
+  within 50 ms. One between `tolerance_ms` and a second out on two readings
+  running is fine-tuned. Inside `tolerance_ms` it is left alone.
+- While the leader is paused the followers are paused, to within about 1.5 s
+  of the leader's frame. They are tightened when play resumes.
+- When the leader goes to live TV on a channel that is already being
+  recorded, it is moved onto that recording at once and the followers
+  follow. On a channel that is not being recorded, that happens once the
+  leader has stayed there for `live_settle` seconds, and a recording is
+  started. Flipping through channels faster than that records nothing, and
+  a channel change while the session is checking a channel starts the wait
+  again on the new one.
+- Once the session has begun moving the leader from live TV onto a
+  recording, stopping the session does not interrupt the move: it runs to
+  its end, which takes well under a minute, so the leader is not left on
+  live TV with a recording running, or far behind live.
+- With no DVR server set up, a leader on live TV cannot be followed. A
+  problem is reported, once per visit to live TV and only after the leader
+  has stayed on one channel for `live_settle`. The DVR server is looked up
+  each time it is needed, so one set up while a session runs is used.
+- A failure to move the leader onto a recording is reported once and not
+  tried again until the leader changes channel or leaves live TV. A moment
+  in which the leader cannot be read does not count as leaving.
+- A leader that is stopped, out of Channels, or left at the end of a
+  recording is not followed; the followers stay as they are. The session
+  keeps running.
+
+Reaction time is about a second, the interval between readings.
+
+While a session runs, each follower's media player has the attributes
+`following` (the leader's entity ID) and `follow_status`, and the leader's
+has `followed_by`. They are absent otherwise, and an unavailable entity
+shows no attributes.
+
+| `follow_status` | Meaning |
+| --- | --- |
+| `in_sync` | Within tolerance, or the leader has nothing to follow |
+| `correcting` | Being brought into line |
+| `resting` | Five corrections in a row failed; left alone for 30 s |
+| `absent` | Its app is not answering |
+
+A follower that keeps having to be rested is reported once, not each time:
+it is reported again only after it has been `in_sync` in between.
+
+Problems a person would want to hear about are fired as the event
+`channels_follow_problem`, with `leader`, `follower` (null when it is about
+the leader) and `message`, a sentence fit for a notification. A message about
+a follower begins with that TV's name, so `message` alone says which TV:
+
+```yaml
+triggers:
+  - trigger: event
+    event_type: channels_follow_problem
+actions:
+  - action: persistent_notification.create
+    data:
+      title: Channels
+      message: "{{ trigger.event.data.message }}"
+```
+
+A TV can follow one leader at a time, a TV that is following cannot lead,
+and a TV that is leading cannot be made a follower of another. `start_follow`
+raises for any of these, and for a leader that is not a Channels media player
+or whose entry is not loaded.
+
+If no follower is left after leaving out the leader itself and TVs that do
+not exist yet, no session is started, and the leader's existing session, if
+it has one, is ended. Nothing is raised.
+
+Stopping a session while a follower is in the middle of a correction leaves
+that follower in the leader's play state as far as the session knew it:
+playing if the leader was playing. A session that ends by itself, which
+should not happen, is forgotten: its attributes go and its followers can be
+followed again.
+
+`sync_playback` may be called while a session runs, but then both correct
+the same TVs for a few seconds, and there is no need to: the session is
+already keeping them in line.
+
 ### `channels.seek_by`, `channels.seek_forward`, `channels.seek_backward`
 
 Kept from the built-in integration. `seek_by` takes fractional seconds.
@@ -116,7 +235,9 @@ Kept from the built-in integration. `seek_by` takes fractional seconds.
 ## Options
 
 Each TV has a **sync offset** in milliseconds. A positive value makes that TV
-play later than the leader when syncing.
+play later than the leader when syncing. A follow session honours each
+follower's offset too, reading it when the session starts: a change takes
+effect at the next `start_follow`.
 
 ## Development
 

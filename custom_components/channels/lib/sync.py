@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import logging
 from statistics import median
 from typing import Protocol
 
 from .clock import Clock
 from .models import STATE_PAUSED, STATE_PLAYING, AppStatus, ChannelsError
 from .playback import start_playback
+
+_LOGGER = logging.getLogger(__name__)
 
 LEAD = 1.0  # a coarse seek aims the follower this far ahead of the leader
 MAX_PAUSE = 3.0  # the largest lead fixed by pausing rather than seeking
@@ -119,9 +122,24 @@ async def measure_offset(
 async def _hold(player: Player, seconds: float, clock: Clock) -> None:
     """Pause for a measured time, counting the pause call's own latency."""
     started = clock.time()
-    await player.pause()
-    await clock.sleep(max(0.0, seconds - (clock.time() - started)))
-    await player.resume()
+    try:
+        await player.pause()
+        await clock.sleep(max(0.0, seconds - (clock.time() - started)))
+    except BaseException:
+        # Cancelled or failed while the player may be paused: do not leave it
+        # so. A resume on a player that is already playing does nothing. The
+        # original exception always leaves: a failed resume must never replace
+        # a cancellation, or the task could not be stopped.
+        try:
+            await asyncio.shield(player.resume())
+        except Exception:
+            _LOGGER.warning(
+                "Could not resume a player after an interrupted hold", exc_info=True
+            )
+        raise
+    # Shielded too: a stop that lands while this request is in flight must not
+    # cancel it and leave the player paused.
+    await asyncio.shield(player.resume())
 
 
 async def _match_play_state(

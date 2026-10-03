@@ -91,6 +91,42 @@
         }
       }
     },
+    "start_follow": {
+      "name": "Start following",
+      "description": "Keeps follower TVs on the leader's recording and position until stopped. A follower that drifts, or is paused or moved with its own remote, is pulled back; one that leaves Channels is left alone until it returns.",
+      "fields": {
+        "leader": {
+          "name": "Leader",
+          "description": "The Channels player the others are held to."
+        },
+        "followers": {
+          "name": "Followers",
+          "description": "The Channels players to keep in line with the leader."
+        },
+        "tolerance_ms": {
+          "name": "Tolerance",
+          "description": "How far from the leader a playing follower may be before it is corrected."
+        },
+        "live_settle": {
+          "name": "Live settle time",
+          "description": "How long the leader must stay on a live channel that is not being recorded before a recording is started."
+        },
+        "behind_live": {
+          "name": "Behind live",
+          "description": "How far behind the live edge the leader lands when it is moved onto a recording."
+        }
+      }
+    },
+    "stop_follow": {
+      "name": "Stop following",
+      "description": "Ends the leader's follow session. The followers are left as they are.",
+      "fields": {
+        "leader": {
+          "name": "Leader",
+          "description": "The Channels player whose session to end."
+        }
+      }
+    },
     "seek_by": {
       "name": "Seek by",
       "description": "Seeks forwards or backwards by a number of seconds.",

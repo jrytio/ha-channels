@@ -12,6 +12,7 @@ from homeassistant.helpers.typing import ConfigType
 
 from .const import CONF_KIND, DOMAIN, KIND_APP, MANUFACTURER
 from .coordinator import ChannelsAppCoordinator
+from .follow import async_stop_follow
 from .lib import AppClient, ChannelsError, DvrClient
 from .services import async_setup_services
 
@@ -63,5 +64,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ChannelsConfigEntry) -> 
 async def async_unload_entry(hass: HomeAssistant, entry: ChannelsConfigEntry) -> bool:
     """Unload an entry."""
     if entry.data[CONF_KIND] == KIND_APP:
+        # Its task ends with the entry anyway; this also clears the record of it.
+        async_stop_follow(hass, entry.entry_id)
         return await hass.config_entries.async_unload_platforms(entry, APP_PLATFORMS)
     return True

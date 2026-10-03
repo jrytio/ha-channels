@@ -1,5 +1,7 @@
 """Tests for moving an app from live TV onto a recording."""
 
+from dataclasses import replace
+
 import pytest
 
 from custom_components.channels.lib.models import ChannelsConnectionError, FailedJob
@@ -479,3 +481,73 @@ async def test_two_apps_on_one_channel_switched_in_turn_share_one_recording(
     assert first.started_recording is True
     assert second.started_recording is False
     assert first.recording_id == second.recording_id == recording.id
+
+
+async def test_channel_change_during_the_failed_job_lookup_sends_no_toggle(clock):
+    dvr = SimDvr(clock, latency=0.1)
+    app = SimPlayer(clock, dvr=dvr)
+    app.watch_live(CHANNEL)
+    elsewhere = dvr.add("3.1", age=600.0)  # a recording running on another channel
+    looked_up = dvr.recent_failed_job
+
+    async def recent_failed_job(channel, since):
+        failed = await looked_up(channel, since)
+        if "toggle_record" not in app.calls:
+            app.channel = "3.1"  # the viewer changes channel while the DVR answers
+        return failed
+
+    dvr.recent_failed_job = recent_failed_job
+
+    with pytest.raises(
+        SwitchError,
+        match="^The channel changed before a recording could be started$",
+    ) as raised:
+        await switch_to_recording(app, dvr, clock=clock)
+
+    assert "toggle_record" not in app.calls
+    assert dvr.recordings[elsewhere.id].completed is False
+    assert raised.value.started_recording is False
+
+
+class ChangesChannelAsItRecords(SimPlayer):
+    """A player the viewer moves to another channel just as the toggle arrives."""
+
+    async def toggle_record(self):
+        self.channel = "3.1"
+        return await super().toggle_record()
+
+
+async def test_a_toggle_that_reached_another_channel_is_reported(clock, dvr):
+    app = ChangesChannelAsItRecords(clock, dvr=dvr)
+    app.watch_live(CHANNEL)
+
+    with pytest.raises(SwitchError) as raised:
+        await switch_to_recording(app, dvr, clock=clock)
+
+    assert str(raised.value) == (
+        "The channel changed as the recording was requested; "
+        "the record command went to channel 3.1. Check the DVR"
+    )
+    assert raised.value.started_recording is True
+    assert app.calls.count("toggle_record") == 1
+
+
+class RepliesWithoutAChannel(SimPlayer):
+    """A player whose reply to the record toggle does not say what channel it is on."""
+
+    async def toggle_record(self):
+        return replace(await super().toggle_record(), channel_number=None)
+
+
+async def test_a_toggle_reply_with_no_channel_is_not_taken_as_a_channel_change(
+    clock, dvr
+):
+    app = RepliesWithoutAChannel(clock, dvr=dvr)
+    app.watch_live(CHANNEL)
+
+    result = await switch_to_recording(app, dvr, clock=clock)
+
+    assert result.started_recording is True
+    assert result.switched is True
+    assert app.recording_id == result.recording_id
+    assert app.calls.count("toggle_record") == 1

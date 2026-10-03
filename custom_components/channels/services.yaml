@@ -45,6 +45,52 @@ switch_to_recording:
           max: 60
           unit_of_measurement: seconds
 
+start_follow:
+  fields:
+    leader:
+      required: true
+      selector:
+        entity:
+          integration: channels
+          domain: media_player
+    followers:
+      required: true
+      selector:
+        entity:
+          integration: channels
+          domain: media_player
+          multiple: true
+    tolerance_ms:
+      default: 250
+      selector:
+        number:
+          min: 100
+          max: 900
+          unit_of_measurement: ms
+    live_settle:
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 300
+          unit_of_measurement: seconds
+    behind_live:
+      default: 5
+      selector:
+        number:
+          min: 3
+          max: 60
+          unit_of_measurement: seconds
+
+stop_follow:
+  fields:
+    leader:
+      required: true
+      selector:
+        entity:
+          integration: channels
+          domain: media_player
+
 seek_by:
   target:
     entity:
