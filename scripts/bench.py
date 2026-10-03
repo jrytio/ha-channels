@@ -6,12 +6,15 @@ integration needs a Home Assistant restart, and this needs none.
     uv run python -m scripts.bench status 10.0.0.1 10.0.0.2
     uv run python -m scripts.bench sync 10.0.0.1 10.0.0.2 --monitor 20
     uv run python -m scripts.bench switch 10.0.0.1 --dvr 10.0.0.9
+    uv run python -m scripts.bench follow 10.0.0.1 10.0.0.2 --dvr 10.0.0.9
+    uv run python -m scripts.bench follow 10.0.0.1 10.0.0.2 --watch-only
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import suppress
 from dataclasses import asdict
 import json
 
@@ -21,6 +24,8 @@ from custom_components.channels.lib import (
     AppClient,
     ChannelsError,
     DvrClient,
+    Follower,
+    FollowSession,
     SystemClock,
     switch_to_recording,
     sync_follower,
@@ -78,6 +83,67 @@ async def cmd_switch(args: argparse.Namespace, session: aiohttp.ClientSession) -
     print(asdict(result))
 
 
+async def _paired_offsets(leader: AppClient, followers: dict[str, AppClient]) -> str:
+    """Read every app once and describe each follower against the leader."""
+    readings = await asyncio.gather(
+        leader.status(),
+        *(follower.status() for follower in followers.values()),
+        return_exceptions=True,
+    )
+    lead, rest = readings[0], readings[1:]
+    if isinstance(lead, BaseException):
+        return f"leader: {lead}"
+    where = "live" if lead.position is None else f"{lead.position:8.2f}"
+    parts = [f"leader {lead.state} {where}"]
+    for host, status in zip(followers, rest, strict=True):
+        if isinstance(status, BaseException):
+            parts.append(f"{host} absent")
+        elif status.position is None or lead.position is None:
+            parts.append(f"{host} {status.state}")
+        else:
+            offset = status.position - lead.position
+            if lead.state == "playing":
+                offset -= status.sampled_at - lead.sampled_at
+            parts.append(f"{host} {status.state} {offset * 1000:+8.1f} ms")
+    return " | ".join(parts)
+
+
+async def cmd_follow(args: argparse.Namespace, session: aiohttp.ClientSession) -> None:
+    clock = SystemClock()
+    leader = AppClient(args.leader, session)
+    followers = {host: AppClient(host, session) for host in args.followers}
+    task: asyncio.Task[None] | None = None
+    if not args.watch_only:
+        follow = FollowSession(
+            leader,
+            {
+                host: Follower(client, target=-args.offset_ms / 1000)
+                for host, client in followers.items()
+            },
+            dvr=DvrClient(args.dvr, session) if args.dvr else None,
+            clock=clock,
+            tolerance=args.tolerance_ms / 1000,
+            live_settle=args.live_settle,
+            behind_live=args.behind_live,
+            on_problem=lambda who, message: print(
+                f"  PROBLEM {who or 'leader'}: {message}"
+            ),
+            on_status=lambda who, status: print(f"  {who} -> {status}"),
+        )
+        task = asyncio.create_task(follow.run())
+    started = clock.time()
+    try:
+        while clock.time() - started < args.seconds:
+            await clock.sleep(1.0)
+            line = await _paired_offsets(leader, followers)
+            print(f"t+{clock.time() - started:6.1f}s {line}")
+    finally:
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -101,6 +167,24 @@ def parse_args() -> argparse.Namespace:
     switch.add_argument("--dvr", required=True)
     switch.add_argument("--behind-live", type=float, default=5)
     switch.set_defaults(run=cmd_switch)
+
+    follow = commands.add_parser(
+        "follow", help="keep followers on a leader until the time is up"
+    )
+    follow.add_argument("leader")
+    follow.add_argument("followers", nargs="+")
+    follow.add_argument("--dvr", help="needed to follow the leader onto live TV")
+    follow.add_argument("--seconds", type=float, default=120)
+    follow.add_argument("--tolerance-ms", type=float, default=250)
+    follow.add_argument("--offset-ms", type=float, default=0)
+    follow.add_argument("--live-settle", type=float, default=10)
+    follow.add_argument("--behind-live", type=float, default=5)
+    follow.add_argument(
+        "--watch-only",
+        action="store_true",
+        help="print each follower's offset once a second and correct nothing",
+    )
+    follow.set_defaults(run=cmd_follow)
 
     return parser.parse_args()
 

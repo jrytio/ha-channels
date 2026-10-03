@@ -176,6 +176,8 @@ custom_components/channels/
     playback.py      # start a recording and wait until it is playing
     sync.py          # the sync engine
     recording.py     # live TV to recording
+    follow.py        # the follow session: keeps followers on a leader
+  follow.py          # running sessions, one per leader, as background tasks
 tests/
 ```
 
@@ -236,7 +238,9 @@ configured sync offset: a TV set to +80 ms is aimed 80 ms behind the leader.
    - **Leader paused:** seek the follower by the error. Nothing is moving, so
      a seek is the only tool.
    - **Follower ahead by 45 ms to 3 s:** pause the follower for the error
-     minus 45 ms, then resume.
+     minus 45 ms, then resume. The resume is in a `finally`, run through
+     `asyncio.shield`, so a sync or a session cancelled mid-hold does not
+     leave a TV paused.
    - **Anything else:** seek the follower to 1 s ahead of the leader, so the
      next round can pause.
 
@@ -472,9 +476,113 @@ is not loaded, `error` says so and `followers` is empty.
 entity actions kept from the built-in integration so this one is a drop-in
 replacement. `seek_by` accepts fractional seconds.
 
+**`channels.start_follow`** and **`channels.stop_follow`** — domain actions
+with no response. `start_follow` takes `leader`, `followers`, `tolerance_ms`
+(default 250, 100 to 900), `live_settle` (default 10 s) and `behind_live`
+(default 5 s), builds a `FollowSession` and runs it as a background task of
+the leader's config entry. A session for a leader that already has one
+replaces it. `stop_follow` takes `leader` and cancels its session.
+
+Followers with no entity registry entry, and the leader itself, are left
+out. A follower already in another leader's session, a follower that is
+leading a session of its own, and a leader that is itself following, raise
+`ServiceValidationError`: two sessions pulling one TV two ways would never
+settle. If no follower is left after the leaving out, no session is started,
+the leader's existing session, if it has one, is ended, and nothing is
+raised.
+
+A done-callback on the session's task removes it from the registry if it ends
+by itself, logs its exception, and refreshes the attributes. It removes only
+its own entry, so a replaced session's late end cannot remove its successor.
+
+A follower's app is reached through its config entry each time, not through
+a client captured at start. While the entry is not loaded the follower is
+treated as not answering, and after a reload the new client is used.
+
+The session's problem callback fires the event `channels_follow_problem`
+(`leader`, `follower` or null, `message`). Its status callback sends a
+dispatcher signal; every Channels media player listens and rewrites its
+state, which is how `following`, `follow_status` and `followed_by` stay
+current between polls.
+
+### The follow session
+
+`lib/follow.py`. One task reads the leader every `TICK` (1 s) and publishes
+the reading. Each follower has its own task, woken by each new reading, so a
+follower in the middle of a several-second fine-tune does not delay the
+others.
+
+The leader's reading is published as "nothing to follow" when the app is
+unreachable, stopped, on live TV, or at position 0. Position 0 is where a
+recording that played to its end sits, reported as playing or paused;
+following it would drag every follower to the start. A recording just
+started from the beginning reports 0 too, for a second or two while it
+loads, and is followed as soon as it moves.
+
+On live TV the session looks at the DVR once when the channel is first seen.
+If the channel has a recording in progress or an active job, it calls
+`switch_to_recording` at once, under the lock the switch action uses. If
+not, it waits until the leader has been on that channel for `live_settle`
+and then calls it. A failure is reported once and not retried until the
+leader changes channel or leaves live TV, since a retry could send the record
+toggle again. Any exception while moving the leader, not only a
+`ChannelsError`, ends the attempts for that channel; one that was not
+expected is reported with the `UNEXPECTED` message. A moment in which the
+leader cannot be read does not count as leaving live TV.
+
+With no DVR client the session cannot move the leader. It reports that once
+per visit to live TV, and only after the leader has stayed on one channel for
+`live_settle`.
+
+Each follower pass makes at most one correction, the first of these that
+applies:
+
+1. Not answering: `absent`, nothing sent.
+2. Not on the leader's recording, or sitting at position 0 while the leader
+   is past 1 s: `start_playback`.
+3. Play state differs: pause or resume.
+4. Leader paused and the follower more than `PAUSED_SLACK` (1.5 s) out: a
+   plain seek. It is counted toward resting exactly like the playing jump in
+   rule 5: a seek that is needed again on the next pass, with the leader not
+   having moved, is a failed correction.
+5. More than `JUMP` (1 s) out: a plain seek by the difference.
+6. A coarse correction (2, a resume, or 5) was made last time, or the
+   follower has been outside the tolerance for `CONFIRM` (2) passes running:
+   `sync_follower` with a 50 ms tolerance.
+
+Where it should be is the leader's position, carried forward to the moment
+the follower was read, plus the follower's target offset.
+
+A fine-tune is given a guarded view of the leader that raises `LeaderError`
+when the leader's reading is not followable (stopped, live TV, position 0), so
+a leader that reaches the end of its recording mid-fine-tune cannot drag the
+follower to the start. A fine-tune takes its own readings of the leader; if
+the leader seeks mid-fine-tune the fine-tune follows it. It is abandoned only
+when the leader stops being followable or changes recording.
+
+Rule 6 fine-tunes after every coarse correction because a plain seek lands
+within a second, not within the tolerance; a fine-tune that finds the
+follower already close sends nothing. The two-pass rule exists because the
+fine-tune corrects to 50 ms: one stray reading must not cause a visible hop
+on a follower that is inside the tolerance.
+
+A failed correction is counted: a recording that will not start, a command
+that errors, a fine-tune that does not end synced, a plain seek that is
+still needed on the next pass. A success clears the count. After
+`REST_AFTER` (5) in a row the follower is left alone for `REST_FOR` (30 s)
+and a problem is reported. Failures are not counted when the leader has
+moved since, which the leader task tracks as an epoch that goes up on every
+change of recording, play state, or position beyond what playing accounts
+for. Someone pressing skip ten times is not a follower failing to keep up.
+
+An unexpected exception in a follower's task rests the follower and is
+reported with the `UNEXPECTED` message, not the "could not be kept in step"
+one. The session's callbacks are called inside a guard: a callback that
+raises is logged and does not end the session.
+
 ### Errors
 
-The two actions above put operational failures in their response. Both
+The two sync actions above put operational failures in their response. Both
 raise `ServiceValidationError` for a target or leader that is not a Channels
 media player, and the schema rejects a field that is missing or out of range.
 The ordinary media player commands and the three seek actions raise
@@ -494,6 +602,11 @@ notification.
   `channels`.
 - **Clients:** mocked HTTP, using response bodies captured from the real
   devices on 2026-10-01.
+- **Follow session:** scenario tests against the same simulated players,
+  several at once, on a fake clock that parks each sleeping task and jumps
+  to the next wake time. The simulated player has remote-control actions
+  that are not logged as engine commands, so a test can say "someone
+  rewound the Office" and then assert what the session sent.
 - **HA layer:** `pytest-homeassistant-custom-component` for the config flow
   (zeroconf, manual, duplicate, IP change), entity state mapping, and action
   schemas and responses.
