@@ -8,8 +8,10 @@ recording, and a load time after a play during which seeks are discarded.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
-from itertools import cycle
+import heapq
+from itertools import count, cycle
 from typing import Any
 
 from custom_components.channels.lib.models import (
@@ -36,6 +38,49 @@ class FakeClock:
 
     async def sleep(self, seconds: float) -> None:
         self.now += max(0.0, seconds)
+
+
+class ConcurrentClock(FakeClock):
+    """A fake clock for code that runs several tasks at once.
+
+    `FakeClock.sleep` jumps the clock forward, which is only right while one
+    task is running. Here `sleep` parks the caller until the clock reaches
+    its wake time, and `run_for` drives everything: whenever no task can
+    run, it jumps to the earliest wake time and wakes that sleeper.
+    """
+
+    def __init__(self, start: float = 1_790_000_000.0) -> None:
+        super().__init__(start)
+        self._sleepers: list[tuple[float, int, asyncio.Future[None]]] = []
+        self._order = count()
+
+    async def sleep(self, seconds: float) -> None:
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        wake = self.now + max(0.0, seconds)
+        heapq.heappush(self._sleepers, (wake, next(self._order), future))
+        await future
+
+    async def _settle(self) -> None:
+        """Let every task that can run do so, until all of them are parked."""
+        loop = asyncio.get_running_loop()
+        await asyncio.sleep(0)
+        # The loop's queue of callbacks ready to run. Private, but it is the
+        # one exact answer to "is anything still runnable?".
+        while loop._ready:  # noqa: ASYNC110  there is no event to wait on
+            await asyncio.sleep(0)
+
+    async def run_for(self, seconds: float) -> None:
+        """Advance the clock by `seconds`, running tasks as their sleeps end."""
+        end = self.now + seconds
+        await self._settle()
+        while self._sleepers and self._sleepers[0][0] <= end:
+            wake, _, future = heapq.heappop(self._sleepers)
+            if future.done():  # its task was cancelled while asleep
+                continue
+            self.now = max(self.now, wake)
+            future.set_result(None)
+            await self._settle()
+        self.now = end
 
 
 class SimDvr:
@@ -211,6 +256,7 @@ class SimPlayer:
         self._load_position = 0.0
         self._at_end = False  # paused at 0 after a recording played to its end
         self._drop_plays = 0
+        self.in_front = True  # False while another app is in front on the TV
 
     # -- test setup helpers -------------------------------------------------
 
@@ -238,6 +284,31 @@ class SimPlayer:
     def drop_next_play(self, count: int = 1) -> None:
         """Make the next `count` play commands have no effect."""
         self._drop_plays += count
+
+    # -- what a person does with the TV's own remote ---------------------------
+    # None of these is recorded in `calls`: those are the engine's commands.
+
+    def user_pause(self) -> None:
+        if self.state == STATE_PLAYING:
+            self._base, self.state = self.position(), STATE_PAUSED
+
+    def user_resume(self) -> None:
+        if self.state == STATE_PAUSED:
+            self.state, self._since = STATE_PLAYING, self.clock.time()
+
+    def user_seek(self, seconds: float) -> None:
+        self._move_to(self.position() + seconds)
+
+    def user_stop(self) -> None:
+        self.recording_id, self.channel, self.state = None, None, STATE_STOPPED
+
+    def leave_app(self) -> None:
+        """Put another app in front: playback pauses and the API stops answering."""
+        self.user_pause()
+        self.in_front = False
+
+    def return_to_app(self) -> None:
+        self.in_front = True
 
     def position(self) -> float | None:
         """Return the true position right now (what is reported, while loading)."""
@@ -276,7 +347,9 @@ class SimPlayer:
             self.calls.append(call)
             self.log.append((self.clock.time(), call))
         await self.clock.sleep(self.latency)
-        if self.reachable_at is not None and self.clock.time() < self.reachable_at:
+        if not self.in_front or (
+            self.reachable_at is not None and self.clock.time() < self.reachable_at
+        ):
             raise ChannelsConnectionError("the app is not in the foreground")
         position = self.position()
         if position is not None and report_noise:
