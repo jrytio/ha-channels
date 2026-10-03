@@ -18,12 +18,14 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, MANUFACTURER
+from .const import DOMAIN, MANUFACTURER, SIGNAL_FOLLOW_UPDATED
 from .coordinator import ChannelsAppCoordinator
+from .follow import follow_attributes
 from .lib import AppStatus, ChannelsError
 
 _STATES = {
@@ -86,6 +88,15 @@ class ChannelsMediaPlayer(CoordinatorEntity[ChannelsAppCoordinator], MediaPlayer
             name=entry.title,
             manufacturer=MANUFACTURER,
             model="Channels app",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Show changes in a follow session as they happen."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, SIGNAL_FOLLOW_UPDATED, self.async_write_ha_state
+            )
         )
 
     @property
@@ -200,6 +211,7 @@ class ChannelsMediaPlayer(CoordinatorEntity[ChannelsAppCoordinator], MediaPlayer
             "recording_id": self._status.recording_id,
             "channel_number": self._status.channel_number,
             "channel_name": self._status.channel_name,
+            **follow_attributes(self.hass, self.entity_id),
         }
 
     async def _run(self, command: Awaitable[AppStatus]) -> None:
