@@ -137,7 +137,9 @@ async def _hold(player: Player, seconds: float, clock: Clock) -> None:
                 "Could not resume a player after an interrupted hold", exc_info=True
             )
         raise
-    await player.resume()
+    # Shielded too: a stop that lands while this request is in flight must not
+    # cancel it and leave the player paused.
+    await asyncio.shield(player.resume())
 
 
 async def _match_play_state(

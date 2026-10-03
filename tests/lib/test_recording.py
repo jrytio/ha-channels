@@ -1,5 +1,7 @@
 """Tests for moving an app from live TV onto a recording."""
 
+from dataclasses import replace
+
 import pytest
 
 from custom_components.channels.lib.models import ChannelsConnectionError, FailedJob
@@ -527,4 +529,25 @@ async def test_a_toggle_that_reached_another_channel_is_reported(clock, dvr):
         "the record command went to channel 3.1. Check the DVR"
     )
     assert raised.value.started_recording is True
+    assert app.calls.count("toggle_record") == 1
+
+
+class RepliesWithoutAChannel(SimPlayer):
+    """A player whose reply to the record toggle does not say what channel it is on."""
+
+    async def toggle_record(self):
+        return replace(await super().toggle_record(), channel_number=None)
+
+
+async def test_a_toggle_reply_with_no_channel_is_not_taken_as_a_channel_change(
+    clock, dvr
+):
+    app = RepliesWithoutAChannel(clock, dvr=dvr)
+    app.watch_live(CHANNEL)
+
+    result = await switch_to_recording(app, dvr, clock=clock)
+
+    assert result.started_recording is True
+    assert result.switched is True
+    assert app.recording_id == result.recording_id
     assert app.calls.count("toggle_record") == 1

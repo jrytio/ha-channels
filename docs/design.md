@@ -240,9 +240,10 @@ configured sync offset: a TV set to +80 ms is aimed 80 ms behind the leader.
    - **Leader paused:** seek the follower by the error. Nothing is moving, so
      a seek is the only tool.
    - **Follower ahead by 45 ms to 3 s:** pause the follower for the error
-     minus 45 ms, then resume. A hold that is cancelled or fails while the
-     follower may be paused sends the resume through `asyncio.shield`, so a
-     sync or a session cancelled mid-hold does not leave a TV paused. The
+     minus 45 ms, then resume. Every resume that ends a hold goes through
+     `asyncio.shield`, the ordinary one and the one sent when the hold is
+     cancelled or fails, so a sync or a session stopped at any point in a
+     hold does not leave a TV paused. The
      original exception always leaves the hold: a resume that fails then is
      logged as a warning and never replaces a cancellation, which would
      leave a session that could not be stopped.
@@ -415,7 +416,8 @@ For each player:
    another channel, the toggle went there, and the switch fails with "The
    channel changed as the recording was requested; the record command went
    to channel N. Check the DVR" and `started_recording: true` (a recording
-   may have been started or stopped on that channel). Otherwise poll the
+   may have been started or stopped on that channel). A reply that names no
+   channel is not taken as evidence either way. Otherwise poll the
    DVR every 0.5 s for up to 10 s for the new file. A failed job newer than
    the one noted (judged on the DVR's own clock) ends the wait early with
    that job's error text. If neither a file nor a new failed job appears in

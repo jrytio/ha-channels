@@ -642,6 +642,45 @@ async def test_cancelling_mid_fine_tune_does_not_leave_a_tv_paused(clock, dvr, l
     assert commands(follower)[-1] == "resume"
 
 
+class ResumeLandsLate(SimPlayer):
+    """A player on which a resume takes effect only once its request completes.
+
+    The stock player applies a command before its latency, so a request
+    cancelled in flight has still happened. On a real TV it may not have.
+    """
+
+    resuming = False
+
+    async def resume(self):
+        self.resuming = True
+        await self.clock.sleep(0.2)
+        return await super().resume()
+
+
+async def test_a_stop_during_the_resume_that_ends_a_hold_still_resumes_the_tv(
+    clock, dvr, leader
+):
+    follower = ResumeLandsLate(clock, dvr=dvr)
+    follower.watch_recording(REC, 500.6)
+    session = FollowSession(
+        leader, {"office": Follower(follower)}, dvr=dvr, clock=clock
+    )
+
+    task = asyncio.create_task(session.run())
+    for _ in range(600):
+        await clock.run_for(0.05)
+        if follower.resuming:
+            break
+    assert follower.resuming
+    assert follower.state == STATE_PAUSED
+    task.cancel()
+    await clock.run_for(2)
+    with suppress(asyncio.CancelledError):
+        await task
+
+    assert follower.state == STATE_PLAYING
+
+
 async def test_a_failed_live_switch_is_not_retried_after_a_leader_read_blip(
     clock, dvr, session, leader, problems
 ):
@@ -1179,3 +1218,37 @@ async def test_a_follower_that_will_not_settle_is_reported_once_per_streak(
         await clock.run_for(200)
 
     assert problems == [("office", WILL_NOT_SETTLE)] * 2
+
+
+async def test_one_reading_out_before_and_after_a_pause_is_not_two_in_a_row(
+    clock, dvr, leader
+):
+    """Both TVs paused and resumed with their own remotes: the session sends nothing."""
+    follower = Misread(clock, dvr=dvr)
+    follower.watch_recording(REC, 500.0)
+    seen: list[str] = []
+    session = FollowSession(
+        leader,
+        {"office": Follower(follower)},
+        dvr=dvr,
+        clock=clock,
+        on_status=lambda name, status: seen.append(status),
+    )
+
+    async with running(session, clock):
+        await clock.run_for(5)
+        follower.bump = 0.4  # out for one pass
+        await clock.run_for(0.5)
+        follower.bump = 0.0
+        leader.user_pause()
+        follower.user_pause()
+        await clock.run_for(5)
+        leader.user_resume()
+        follower.user_resume()
+        follower.bump = 0.4  # out for one pass again
+        await clock.run_for(1)
+        follower.bump = 0.0
+        await clock.run_for(10)
+
+    assert "correcting" not in seen
+    assert follower.calls == []

@@ -95,14 +95,14 @@ async def _start_recording(
     asked_at = clock.time()
     try:
         reply = await app.toggle_record()
-        if reply.channel_number != channel:
+        got = reply.channel_number
+        if got is not None and got != channel:
             # The toggle acts on whatever channel the app is on when it
             # arrives; a recording may have been started or stopped there.
-            got = reply.channel_number
-            where = f"channel {got}" if got is not None else "another programme"
+            # A reply that names no channel is not evidence either way.
             raise SwitchError(
                 "The channel changed as the recording was requested; "
-                f"the record command went to {where}. Check the DVR",
+                f"the record command went to channel {got}. Check the DVR",
                 started_recording=True,
             )
         while clock.time() < asked_at + RECORD_START_TIMEOUT:
