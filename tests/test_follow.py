@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -267,6 +268,35 @@ async def test_a_leader_cannot_be_made_a_follower(
 
     assert len(sessions) == 1
     assert not sessions[0].cancelled
+
+
+async def test_followers_left_out_are_logged(
+    hass, living_room_entry, office_entry, clients, sessions, caplog
+):
+    await setup_integration(hass)
+
+    def logged() -> list[tuple[int, str]]:
+        return [
+            (record.levelno, record.getMessage())
+            for record in caplog.records
+            if record.name == "custom_components.channels.services"
+        ]
+
+    with caplog.at_level(logging.INFO):
+        caplog.clear()
+        await start_follow(hass, followers=[OFFICE, BACK_YARD, "media_player.attic"])
+        ((level, message),) = logged()
+        assert level == logging.WARNING
+        assert BACK_YARD in message
+        assert "media_player.attic" in message
+        assert OFFICE not in message
+
+        caplog.clear()
+        await start_follow(hass, followers=[LIVING_ROOM])
+        ((level, message),) = logged()
+        assert level == logging.INFO
+        assert LIVING_ROOM in message
+        assert "no follower is left" in message
 
 
 async def test_no_followers_left_starts_no_session(

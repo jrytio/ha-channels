@@ -285,10 +285,14 @@ async def _async_start_follow(call: ServiceCall) -> None:
         raise ServiceValidationError(f"{leader_id} is itself following {other}")
 
     followers: dict[str, ConfigEntry] = {}
+    missing: list[str] = []
     for entity_id in dict.fromkeys(call.data[ATTR_FOLLOWERS]):
         entry = async_get_app_entry(hass, entity_id)
         # A room listed ahead of its TV being added is expected; skip it.
-        if entity_id == leader_id or entry is None:
+        if entity_id == leader_id:
+            continue
+        if entry is None:
+            missing.append(entity_id)
             continue
         if (other := async_leader_of(hass, entity_id)) not in (None, leader_id):
             raise ServiceValidationError(f"{entity_id} is already following {other}")
@@ -298,8 +302,17 @@ async def _async_start_follow(call: ServiceCall) -> None:
             )
         followers[entity_id] = entry
 
+    if missing:
+        _LOGGER.warning(
+            "%s will not follow %s: no Channels player exists by that ID",
+            ", ".join(missing),
+            leader_id,
+        )
     if not followers:
         # Nobody to keep in line; a session would only move the leader for no one.
+        _LOGGER.info(
+            "No follow session was started for %s: no follower is left", leader_id
+        )
         async_stop_follow(hass, leader_entry.entry_id)
         return
 

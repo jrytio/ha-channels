@@ -26,7 +26,7 @@ from .recording import (
     SwitchResult,
     switch_to_recording,
 )
-from .sync import SYNCED, LeaderError, Player, sync_follower
+from .sync import START_TIMEOUT, SYNCED, LeaderError, Player, sync_follower
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,9 +35,11 @@ JUMP = 1.0  # beyond this a plain seek is quicker; plain seeks land within 0.1-1
 CONFIRM = 2  # single paired readings were seen up to 130 ms out with nothing wrong
 PAUSED_SLACK = 1.5  # keyframes are 0.7-1.0 s apart; a pause arrives a second late
 FINE_TOLERANCE = 0.05  # what a fine-tune aims for
-START_TIMEOUT = 15.0
 LEADER_JUMP = 0.5  # the leader moved this far from where playing would put it
 REST_AFTER = 5  # failed corrections in a row before a follower is rested
+# How long a rested follower is left alone before it is tried again. Policy,
+# not a measurement: long enough not to hammer a TV that cannot keep up, short
+# enough that one that recovers is soon back in step.
 REST_FOR = 30.0
 
 IN_SYNC = "in_sync"
@@ -177,6 +179,8 @@ class FollowSession:
         # Moves onto a recording still running after a stop, kept from the
         # garbage collector until they end.
         self._moves: set[asyncio.Task[SwitchResult]] = set()
+        # Followers reported as WILL_NOT_SETTLE and not in step since.
+        self._unsettled: set[str] = set()
 
     async def run(self) -> None:
         """Run until cancelled."""
@@ -375,6 +379,8 @@ class FollowSession:
             return
         if lead is None:
             # The leader is stopped, on live TV or gone: nothing to hold to.
+            # "Two passes in a row" does not span the gap.
+            memory.out_of_line = 0
             self._set_status(name, IN_SYNC)
             return
 
@@ -390,8 +396,8 @@ class FollowSession:
             started = await start_playback(
                 player, lead.recording_id, START_TIMEOUT, self._clock
             )
-            if started is None:
-                self._failed(name, memory)
+            if started is None and self._failed(name, memory):
+                return
             memory.tighten = True
             return
 
@@ -412,26 +418,29 @@ class FollowSession:
         error = offset - follower.target
 
         if lead.state == STATE_PAUSED:
+            # "Two passes in a row" does not span a pause.
+            memory.out_of_line = 0
             if abs(error) > PAUSED_SLACK:
                 self._set_status(name, CORRECTING)
-                if memory.jumped_in == self._epoch:
-                    # Same as a playing jump: the last seek did not get it
-                    # there and the leader has not moved since.
-                    self._failed(name, memory)
+                # Same as a playing jump: the last seek did not get it there
+                # and the leader has not moved since.
+                if memory.jumped_in == self._epoch and self._failed(name, memory):
+                    return
                 memory.jumped_in = self._epoch
                 await player.seek(-error)
             else:
                 memory.jumped_in = None
+                memory.failures = 0
                 self._set_status(name, IN_SYNC)
             return
 
         if abs(error) > JUMP:
             self._set_status(name, CORRECTING)
             memory.out_of_line = 0
-            if memory.jumped_in == self._epoch:
-                # The last seek did not get it there and the leader has not
-                # moved since, so that seek failed.
-                self._failed(name, memory)
+            # The last seek did not get it there and the leader has not moved
+            # since, so that seek failed.
+            if memory.jumped_in == self._epoch and self._failed(name, memory):
+                return
             memory.jumped_in = self._epoch
             memory.tighten = True
             await player.seek(-error)
@@ -474,11 +483,16 @@ class FollowSession:
 
     # -- bookkeeping ----------------------------------------------------------
 
-    def _failed(self, name: str, memory: _Memory) -> None:
-        """Count a failed correction; rest the follower after too many in a row."""
+    def _failed(self, name: str, memory: _Memory) -> bool:
+        """Count a failed correction; rest the follower after too many in a row.
+
+        Return True when it was rested, so the pass ends there.
+        """
         memory.failures += 1
         if memory.failures >= REST_AFTER:
             self._rest(name, memory)
+            return True
+        return False
 
     def _rest(self, name: str, memory: _Memory, message: str = WILL_NOT_SETTLE) -> None:
         memory.failures = 0
@@ -487,9 +501,16 @@ class FollowSession:
         memory.tighten = False
         memory.rest_until = self._clock.time() + REST_FOR
         self._set_status(name, RESTING)
+        if message == WILL_NOT_SETTLE:
+            # Once per streak: not again until it has been in step.
+            if name in self._unsettled:
+                return
+            self._unsettled.add(name)
         self._problem(name, message)
 
     def _set_status(self, name: str, status: str) -> None:
+        if status == IN_SYNC:
+            self._unsettled.discard(name)
         if self.statuses[name] == status:
             return
         self.statuses[name] = status

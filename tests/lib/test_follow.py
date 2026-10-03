@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 
 import pytest
 
@@ -536,7 +537,7 @@ async def test_follower_whose_seeks_do_nothing_is_rested(clock, dvr, leader, pro
 
     assert problems == [("office", WILL_NOT_SETTLE)]
     assert session.statuses["office"] == RESTING
-    assert commands(stuck).count("seek") <= 6
+    assert commands(stuck).count("seek") == 5
 
 
 class Faulty(SimPlayer):
@@ -735,7 +736,7 @@ async def test_paused_follower_whose_seeks_do_nothing_is_rested(
 
     assert problems == [("office", WILL_NOT_SETTLE)]
     assert session.statuses["office"] == RESTING
-    assert commands(stuck).count("seek") <= 6
+    assert commands(stuck).count("seek") == 5
 
 
 async def test_channel_surfing_without_a_dvr_reports_nothing_until_it_settles(
@@ -1072,3 +1073,109 @@ async def test_a_follower_on_live_tv_is_put_on_the_leaders_recording(
     assert office.state == STATE_PLAYING
     assert abs(offset(leader, office)) <= CLOSE
     assert "toggle_record" not in commands(office)
+
+
+class Misread(SimPlayer):
+    """A player whose reported position is off by `bump` seconds."""
+
+    bump = 0.0
+
+    async def status(self):
+        reply = await super().status()
+        if reply.position is None:
+            return reply
+        return replace(reply, position=reply.position + self.bump)
+
+
+async def test_one_reading_out_before_and_after_a_gap_is_not_two_in_a_row(
+    clock, dvr, leader
+):
+    follower = Misread(clock, dvr=dvr)
+    follower.watch_recording(REC, 500.0)
+    seen: list[str] = []
+    session = FollowSession(
+        leader,
+        {"office": Follower(follower)},
+        dvr=dvr,
+        clock=clock,
+        on_status=lambda name, status: seen.append(status),
+    )
+
+    async with running(session, clock):
+        await clock.run_for(5)
+        follower.bump = 0.4  # out for one pass
+        await clock.run_for(0.5)
+        follower.bump = 0.0
+        leader.reachable_at = clock.time() + 3  # nothing to follow for a while
+        await clock.run_for(3)
+        follower.bump = 0.4  # out for one pass again
+        await clock.run_for(1)
+        follower.bump = 0.0
+        await clock.run_for(10)
+
+    assert "correcting" not in seen
+    assert follower.calls == []
+
+
+class DeafFor(SimPlayer):
+    """A player whose next `deaf` seeks are acknowledged and do nothing."""
+
+    deaf = 0
+
+    async def seek(self, seconds: float):
+        if self.deaf:
+            self.deaf -= 1
+            return await self._reply(f"seek {seconds:.3f}")
+        return await super().seek(seconds)
+
+
+async def test_a_paused_follower_found_in_line_starts_its_failures_again(
+    clock, dvr, leader, problems
+):
+    follower = DeafFor(clock, dvr=dvr)
+    follower.watch_recording(REC, 480.0)
+    session = FollowSession(
+        leader,
+        {"office": Follower(follower)},
+        dvr=dvr,
+        clock=clock,
+        on_problem=lambda who, message: problems.append((who, message)),
+    )
+    leader.user_pause()
+    follower.user_pause()
+
+    async with running(session, clock):
+        follower.deaf = 4  # four failed seeks, one short of a rest
+        await clock.run_for(8)
+        assert session.statuses["office"] == IN_SYNC
+        follower.user_seek(-20.0)
+        follower.deaf = 4
+        await clock.run_for(8)
+
+    assert problems == []
+    assert session.statuses["office"] == IN_SYNC
+
+
+async def test_a_follower_that_will_not_settle_is_reported_once_per_streak(
+    clock, dvr, leader, problems
+):
+    stuck = SimPlayer(clock, dvr=dvr, starts=False)  # ignores every play command
+    session = FollowSession(
+        leader,
+        {"office": Follower(stuck)},
+        dvr=dvr,
+        clock=clock,
+        on_problem=lambda who, message: problems.append((who, message)),
+    )
+
+    async with running(session, clock):
+        await clock.run_for(200)
+        assert problems == [("office", WILL_NOT_SETTLE)]
+        stuck.starts = True
+        await clock.run_for(60)
+        assert session.statuses["office"] == IN_SYNC
+        stuck.starts = False
+        stuck.user_stop()
+        await clock.run_for(200)
+
+    assert problems == [("office", WILL_NOT_SETTLE)] * 2

@@ -111,7 +111,11 @@ async def _paired_offsets(leader: AppClient, followers: dict[str, AppClient]) ->
 async def cmd_follow(args: argparse.Namespace, session: aiohttp.ClientSession) -> None:
     clock = SystemClock()
     leader = AppClient(args.leader, session)
-    followers = {host: AppClient(host, session) for host in args.followers}
+    hosts = [host for host in args.followers if host != args.leader]
+    if len(hosts) < len(args.followers):
+        # A TV cannot follow itself; the integration leaves it out too.
+        print(f"{args.leader} is the leader, so it is not also a follower")
+    followers = {host: AppClient(host, session) for host in hosts}
     task: asyncio.Task[None] | None = None
     if not args.watch_only:
         follow = FollowSession(
