@@ -32,6 +32,16 @@ class SwitchError(ChannelsError):
         self.started_recording = started_recording
 
 
+class ChannelChanged(SwitchError):
+    """The app is no longer on the channel the switch was asked about.
+
+    Nothing was sent to the app, so it is safe to look again.
+    """
+
+
+CHANNEL_CHANGED = "The channel changed before a recording could be started"
+
+
 class RecordingApp(Protocol):
     """The parts of AppClient this module uses."""
 
@@ -60,21 +70,41 @@ class SwitchResult:
     started_recording: bool
 
 
-async def _start_recording(
-    app: RecordingApp, dvr: RecordingDvr, channel: str, clock: Clock
-) -> Recording:
-    """Toggle recording on and wait for the file. Failures here are post-toggle."""
-    # Whether a failed job is new is judged on the DVR's clock alone: remember
-    # the latest one now and accept only a later one as this attempt's failure.
+async def _failed_job_baseline(dvr: RecordingDvr, channel: str) -> float | None:
+    """Return when the channel's latest failed job was updated, by the DVR's clock.
+
+    Whether a failed job is new is judged on the DVR's clock alone: remember
+    the latest one before the toggle and accept only a later one as this
+    attempt's failure.
+    """
     try:
         previous = await dvr.recent_failed_job(channel, 0.0)
     except ChannelsError as err:
         raise SwitchError(f"The DVR could not be read: {err}") from err
-    baseline = previous.updated_at if previous is not None else None
+    return previous.updated_at if previous is not None else None
 
+
+async def _start_recording(
+    app: RecordingApp,
+    dvr: RecordingDvr,
+    channel: str,
+    baseline: float | None,
+    clock: Clock,
+) -> Recording:
+    """Toggle recording on and wait for the file. Failures here are post-toggle."""
     asked_at = clock.time()
     try:
-        await app.toggle_record()
+        reply = await app.toggle_record()
+        if reply.channel_number != channel:
+            # The toggle acts on whatever channel the app is on when it
+            # arrives; a recording may have been started or stopped there.
+            got = reply.channel_number
+            where = f"channel {got}" if got is not None else "another programme"
+            raise SwitchError(
+                "The channel changed as the recording was requested; "
+                f"the record command went to {where}. Check the DVR",
+                started_recording=True,
+            )
         while clock.time() < asked_at + RECORD_START_TIMEOUT:
             await clock.sleep(POLL)
             recording = await dvr.in_progress_recording(channel)
@@ -172,15 +202,26 @@ async def switch_to_recording(
     *,
     clock: Clock,
     behind_live: float = 5.0,
+    channel: str | None = None,
 ) -> SwitchResult:
     """Put an app that is on live TV onto the recording of that programme.
 
     Uses the recording already in progress on that channel, or starts one.
     Lands `behind_live` seconds behind the live edge. Does nothing when the
     app is already playing a recording.
+
+    `channel` is the live channel the caller decided on. When it is given and
+    the app is no longer on that channel, ChannelChanged is raised before
+    anything is asked of the DVR or sent to the app.
     """
     behind_live = max(behind_live, MIN_BEHIND_LIVE)
     status = await app.status()
+    if channel is not None and (
+        status.state == STATE_STOPPED
+        or status.recording_id is not None
+        or status.channel_number != channel
+    ):
+        raise ChannelChanged(CHANNEL_CHANGED)
     if status.state == STATE_STOPPED:
         raise SwitchError("Nothing is playing in Channels on this TV")
     if status.recording_id is not None:
@@ -197,11 +238,13 @@ async def switch_to_recording(
         recording = await _wait_for_file(dvr, channel, clock)
     if recording is None:
         # Only now is toggle_record safe: with a recording already running it
-        # would stop it. Make sure the app is still on the channel we checked.
+        # would stop it. Make sure the app is still on the channel we checked,
+        # with no other request between that check and the toggle.
         started_recording = True
+        baseline = await _failed_job_baseline(dvr, channel)
         if (await app.status()).channel_number != channel:
-            raise SwitchError("The channel changed before a recording could be started")
-        recording = await _start_recording(app, dvr, channel, clock)
+            raise ChannelChanged(CHANNEL_CHANGED)
+        recording = await _start_recording(app, dvr, channel, baseline, clock)
 
     try:
         await _play_and_settle(app, recording, behind_live, clock)

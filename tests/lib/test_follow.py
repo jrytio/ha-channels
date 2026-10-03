@@ -20,6 +20,7 @@ from custom_components.channels.lib.models import (
     STATE_PAUSED,
     STATE_PLAYING,
     STATE_STOPPED,
+    ChannelsConnectionError,
 )
 
 from .sim import ConcurrentClock, SimDvr, SimPlayer
@@ -828,3 +829,140 @@ async def test_callbacks_that_raise_do_not_end_the_session(clock, dvr, leader, o
 
     assert abs(offset(leader, office)) <= CLOSE
     assert session.statuses["office"] == IN_SYNC
+
+
+# -- fixes from the final review --------------------------------------------------
+
+
+class ResumeFails(SimPlayer):
+    """A player whose resume fails once `failing` is set."""
+
+    failing = False
+
+    async def resume(self):
+        if self.failing:
+            self.calls.append("resume")
+            self.log.append((self.clock.time(), "resume"))
+            raise ChannelsConnectionError("the app is not in the foreground")
+        return await super().resume()
+
+
+async def test_a_session_cancelled_mid_hold_ends_even_if_the_resume_fails(
+    clock, dvr, leader
+):
+    follower = ResumeFails(clock, dvr=dvr)
+    follower.watch_recording(REC, 500.6)
+    session = FollowSession(
+        leader, {"office": Follower(follower)}, dvr=dvr, clock=clock
+    )
+
+    task = asyncio.create_task(session.run())
+    for _ in range(300):
+        await clock.run_for(0.1)
+        if follower.state == STATE_PAUSED:
+            break
+    assert follower.state == STATE_PAUSED
+    follower.failing = True
+    task.cancel()
+    await clock.run_for(2)
+
+    assert task.done()
+    sent = len(follower.calls)
+    await clock.run_for(60)
+    assert len(follower.calls) == sent
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+class Surfer(SimPlayer):
+    """A leader whose viewer moves on from a channel soon after it is read there.
+
+    Once the session has read it on `first`, it moves to `then`: `delay`
+    seconds later, or, with `delay` None, straight after the reading that
+    finds it has been there `stays` seconds.
+    """
+
+    first: str = ""
+    then: str = ""
+    delay: float | None = None
+    stays: float = 0.0
+    moved_at: float | None = None
+    _seen: float | None = None
+
+    async def _move_later(self) -> None:
+        await self.clock.sleep(self.delay)
+        self.watch_live(self.then)
+        self.moved_at = self.clock.time()
+
+    async def status(self):
+        reply = await super().status()
+        if self.moved_at is None and reply.channel_number == self.first:
+            now = self.clock.time()
+            if self._seen is None:
+                self._seen = now
+                if self.delay is not None:
+                    self._mover = asyncio.create_task(self._move_later())
+            if self.delay is None and now - self._seen >= self.stays:
+                self.watch_live(self.then)
+                self.moved_at = now
+        return reply
+
+
+def toggles(player: SimPlayer) -> list[float]:
+    """When the session sent the record toggle to a player."""
+    return [at for at, call in player.log if call == "toggle_record"]
+
+
+async def test_surfing_past_a_recorded_channel_waits_on_the_next_one(clock, problems):
+    dvr = SimDvr(clock, latency=0.3)
+    dvr.add("6.1", age=600.0)
+    leader = Surfer(clock, dvr=dvr)
+    leader.watch_recording(REC, 500.0)
+    leader.first, leader.then, leader.delay = "6.1", "3.1", 0.1
+    office = SimPlayer(clock, dvr=dvr)
+    office.watch_recording(REC, 500.0)
+    session = FollowSession(
+        leader,
+        {"office": Follower(office)},
+        dvr=dvr,
+        clock=clock,
+        on_problem=lambda who, message: problems.append((who, message)),
+    )
+
+    async with running(session, clock):
+        await clock.run_for(5)
+        leader.watch_live("6.1")
+        await clock.run_for(40)
+
+    assert leader.moved_at is not None
+    assert toggles(leader)
+    assert min(toggles(leader)) >= leader.moved_at + 10.0
+    assert problems == []
+
+
+async def test_a_channel_change_as_the_settle_time_ends_starts_it_again(
+    clock, problems
+):
+    dvr = SimDvr(clock, latency=0.3)
+    leader = Surfer(clock, dvr=dvr)
+    leader.watch_recording(REC, 500.0)
+    leader.first, leader.then, leader.stays = "3.1", "10.1", 10.0
+    office = SimPlayer(clock, dvr=dvr)
+    office.watch_recording(REC, 500.0)
+    session = FollowSession(
+        leader,
+        {"office": Follower(office)},
+        dvr=dvr,
+        clock=clock,
+        on_problem=lambda who, message: problems.append((who, message)),
+    )
+
+    async with running(session, clock):
+        await clock.run_for(5)
+        leader.watch_live("3.1")
+        await clock.run_for(40)
+
+    assert leader.moved_at is not None
+    assert toggles(leader)
+    assert min(toggles(leader)) >= leader.moved_at + 10.0
+    assert problems == []

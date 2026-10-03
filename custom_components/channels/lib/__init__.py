@@ -11,7 +11,7 @@ from .models import (
     FailedJob,
     Recording,
 )
-from .recording import SwitchError, SwitchResult, switch_to_recording
+from .recording import ChannelChanged, SwitchError, SwitchResult, switch_to_recording
 from .sync import LeaderError, SyncResult, sync_follower, wait_until_reachable
 
 __all__ = [
@@ -19,6 +19,7 @@ __all__ = [
     "DEFAULT_DVR_PORT",
     "AppClient",
     "AppStatus",
+    "ChannelChanged",
     "ChannelsConnectionError",
     "ChannelsError",
     "Clock",

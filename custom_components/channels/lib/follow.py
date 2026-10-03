@@ -20,7 +20,7 @@ from typing import Protocol
 from .clock import Clock
 from .models import STATE_PAUSED, STATE_PLAYING, AppStatus, ChannelsError
 from .playback import start_playback
-from .recording import RecordingDvr, switch_to_recording
+from .recording import ChannelChanged, RecordingDvr, switch_to_recording
 from .sync import SYNCED, LeaderError, Player, sync_follower
 
 _LOGGER = logging.getLogger(__name__)
@@ -265,7 +265,12 @@ class FollowSession:
                     self._dvr,
                     clock=self._clock,
                     behind_live=self._behind_live,
+                    channel=channel,
                 )
+        except ChannelChanged:
+            # Nothing was sent. The next reading shows the new channel and
+            # starts its settle time.
+            return
         except ChannelsError as err:
             # No second try until the leader changes channel: a retry could
             # send the record toggle again.

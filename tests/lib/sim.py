@@ -92,8 +92,10 @@ class SimDvr:
         *,
         tuner_free: bool = True,
         clock_offset: float = 0.0,
+        latency: float = 0.0,
     ) -> None:
         self.clock = clock
+        self.latency = latency  # how long each request takes to answer
         self.clock_offset = clock_offset  # how far the DVR's clock runs ahead
         self.tuner_free = tuner_free
         self.recordings: dict[str, Recording] = {}
@@ -183,7 +185,14 @@ class SimDvr:
                 )
             )
 
+    async def _respond(self) -> None:
+        # Only when asked for: a zero-length sleep still parks a task on the
+        # concurrent clock, which would change every other test.
+        if self.latency:
+            await self.clock.sleep(self.latency)
+
     async def in_progress_recording(self, channel: str) -> Recording | None:
+        await self._respond()
         live = [
             r
             for r in self.recordings.values()
@@ -196,6 +205,7 @@ class SimDvr:
         return job.get("channel") == channel or channel in job.get("channels", [])
 
     async def has_active_job(self, channel: str, now: float) -> bool:
+        await self._respond()
         return any(
             not job["failed"]
             and not job["skipped"]
@@ -205,6 +215,7 @@ class SimDvr:
         )
 
     async def recent_failed_job(self, channel: str, since: float) -> FailedJob | None:
+        await self._respond()
         failed = [j for j in self.failed if j.channel == channel] + [
             FailedJob.from_dict(job)
             for job in self.jobs
