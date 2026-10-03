@@ -20,7 +20,12 @@ from typing import Protocol
 from .clock import Clock
 from .models import STATE_PAUSED, STATE_PLAYING, AppStatus, ChannelsError
 from .playback import start_playback
-from .recording import ChannelChanged, RecordingDvr, switch_to_recording
+from .recording import (
+    ChannelChanged,
+    RecordingDvr,
+    SwitchResult,
+    switch_to_recording,
+)
 from .sync import SYNCED, LeaderError, Player, sync_follower
 
 _LOGGER = logging.getLogger(__name__)
@@ -127,7 +132,7 @@ class FollowSession:
         leader: LeaderApp,
         followers: Mapping[str, Follower],
         *,
-        dvr: RecordingDvr | None,
+        dvr: RecordingDvr | Callable[[], RecordingDvr | None] | None,
         clock: Clock,
         tolerance: float = 0.25,
         live_settle: float = 10.0,
@@ -141,6 +146,10 @@ class FollowSession:
         `followers` maps a name to its app. `on_problem` is called with a
         follower's name, or None for the leader, and a sentence fit for a
         notification. `on_status` is called when a follower's status changes.
+
+        `dvr` is the DVR client, None when there is none, or a function
+        returning either. A function is called each time the leader on live
+        TV is looked at, so a DVR set up after the session started is used.
         """
         self._leader = leader
         self._followers = dict(followers)
@@ -165,6 +174,9 @@ class FollowSession:
         self._live: _Live | None = None
         self._no_dvr_told = False  # NO_DVR has been reported this visit to live TV
         self._guarded_leader = _GuardedLeader(leader)
+        # Moves onto a recording still running after a stop, kept from the
+        # garbage collector until they end.
+        self._moves: set[asyncio.Task[SwitchResult]] = set()
 
     async def run(self) -> None:
         """Run until cancelled."""
@@ -237,7 +249,8 @@ class FollowSession:
         live = self._live
         if live.gave_up:
             return
-        if self._dvr is None:
+        dvr = self._current_dvr()
+        if dvr is None:
             # Once per visit to live TV, and only when the leader has stayed.
             if (
                 not first_look
@@ -251,22 +264,15 @@ class FollowSession:
             if first_look:
                 # A channel that is already being recorded costs nothing to
                 # follow and frees a tuner, so it is not made to wait.
-                recording = await self._dvr.in_progress_recording(channel)
-                waiting = recording is None and not await self._dvr.has_active_job(
+                recording = await dvr.in_progress_recording(channel)
+                waiting = recording is None and not await dvr.has_active_job(
                     channel, self._clock.time()
                 )
                 if waiting:
                     return
             elif self._clock.time() - live.since < self._live_settle:
                 return
-            async with self._switch_lock:
-                await switch_to_recording(
-                    self._leader,
-                    self._dvr,
-                    clock=self._clock,
-                    behind_live=self._behind_live,
-                    channel=channel,
-                )
+            await self._move_leader(dvr, channel)
         except ChannelChanged:
             # Nothing was sent. The next reading shows the new channel and
             # starts its settle time.
@@ -278,6 +284,55 @@ class FollowSession:
         except Exception:
             _LOGGER.exception("Unexpected error moving the leader to a recording")
             self._give_up(live, UNEXPECTED)
+
+    def _current_dvr(self) -> RecordingDvr | None:
+        """Return the DVR client as it is now."""
+        dvr = self._dvr
+        if dvr is None or hasattr(dvr, "in_progress_recording"):
+            return dvr  # a client, not a function returning one
+        return dvr()
+
+    async def _move_leader(self, dvr: RecordingDvr, channel: str) -> None:
+        """Move the leader onto a recording; a stop does not interrupt the move.
+
+        Stopped halfway, the leader could be left on live TV with a recording
+        it started running, or on a recording far behind live. The move is
+        bounded, so it runs to its end in its own task and is logged.
+        """
+        move = asyncio.create_task(self._switch(dvr, channel))
+        try:
+            await asyncio.shield(move)
+        except asyncio.CancelledError:
+            self._moves.add(move)
+            move.add_done_callback(self._moved_after_stop)
+            raise
+
+    async def _switch(self, dvr: RecordingDvr, channel: str) -> SwitchResult:
+        # The move holds the lock, so it is released only when the move ends.
+        async with self._switch_lock:
+            return await switch_to_recording(
+                self._leader,
+                dvr,
+                clock=self._clock,
+                behind_live=self._behind_live,
+                channel=channel,
+            )
+
+    def _moved_after_stop(self, move: asyncio.Task[SwitchResult]) -> None:
+        self._moves.discard(move)
+        if move.cancelled():
+            _LOGGER.debug("Moving the leader to a recording was cancelled")
+        elif (error := move.exception()) is not None:
+            _LOGGER.warning(
+                "Moving the leader to a recording failed after the session "
+                "was stopped: %s",
+                error,
+            )
+        else:
+            _LOGGER.info(
+                "The leader was moved to recording %s after the session was stopped",
+                move.result().recording_id,
+            )
 
     def _give_up(self, live: _Live, message: str) -> None:
         live.gave_up = True

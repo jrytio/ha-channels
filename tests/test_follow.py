@@ -5,22 +5,29 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 import probatio as vol
 import pytest
-from pytest_homeassistant_custom_component.common import async_capture_events
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_capture_events,
+)
 import yaml
 
 from custom_components.channels.const import (
+    CONF_KIND,
     CONF_SYNC_OFFSET_MS,
     DOMAIN,
     EVENT_FOLLOW_PROBLEM,
+    KIND_DVR,
 )
 from custom_components.channels.diagnostics import async_get_config_entry_diagnostics
 from custom_components.channels.lib import ChannelsConnectionError
 from custom_components.channels.services import (
     START_FOLLOW_SCHEMA,
     STOP_FOLLOW_SCHEMA,
+    _switch_lock,
 )
 
 from .conftest import (
@@ -114,7 +121,8 @@ async def test_start_runs_a_session_with_the_leader_and_followers(
     assert session.leader is clients["10.0.0.1"]
     assert list(session.followers) == [OFFICE]
     assert session.followers[OFFICE].target == 0
-    assert session.options["dvr"] is dvr_client
+    assert session.options["dvr"]() is dvr_client
+    assert session.options["switch_lock"] is _switch_lock(hass)
     assert session.options["tolerance"] == pytest.approx(0.25)
     assert session.options["live_settle"] == 10
     assert session.options["behind_live"] == 5
@@ -136,7 +144,7 @@ async def test_start_passes_the_call_options_and_each_tvs_offset(
     assert session.options["tolerance"] == pytest.approx(0.4)
     assert session.options["live_settle"] == 20
     assert session.options["behind_live"] == 8
-    assert session.options["dvr"] is None
+    assert session.options["dvr"]() is None
 
 
 async def test_follower_commands_reach_its_app(
@@ -146,17 +154,61 @@ async def test_follower_commands_reach_its_app(
     await start_follow(hass)
     player = sessions[0].followers[OFFICE].player
 
+    office = clients["10.0.0.2"]
+    office.status.reset_mock()  # set-up reads it too
+
     await player.status()
     await player.play_recording("15017")
     await player.seek(-3.5)
     await player.pause()
     await player.resume()
 
-    office = clients["10.0.0.2"]
+    office.status.assert_awaited_once()
     office.play_recording.assert_awaited_once_with("15017")
     office.seek.assert_awaited_once_with(-3.5)
     office.pause.assert_awaited_once()
     office.resume.assert_awaited_once()
+
+
+async def test_a_dvr_set_up_after_the_session_started_is_used(
+    hass, living_room_entry, office_entry, clients, dvr_client, sessions
+):
+    await setup_integration(hass)
+    await start_follow(hass)
+    dvr = sessions[0].options["dvr"]
+    assert dvr() is None
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Channels DVR nas6",
+        unique_id="dvr_dvr-nas6.local",
+        data={CONF_KIND: KIND_DVR, CONF_HOST: "10.0.0.9", CONF_PORT: 8089},
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert dvr() is dvr_client
+
+
+async def test_a_follower_reloaded_mid_session_is_reached_through_its_new_client(
+    hass, living_room_entry, office_entry, clients, sessions
+):
+    await setup_integration(hass)
+    await start_follow(hass)
+    player = sessions[0].followers[OFFICE].player
+    old = clients["10.0.0.2"]
+    new = clients["10.0.0.2"] = make_app_client()
+
+    assert await hass.config_entries.async_reload(office_entry.entry_id)
+    await hass.async_block_till_done()
+    old.status.reset_mock()
+    new.status.reset_mock()
+
+    await player.status()
+
+    new.status.assert_awaited_once()
+    old.status.assert_not_awaited()
 
 
 async def test_follower_whose_entry_is_unloaded_does_not_answer(
@@ -346,6 +398,8 @@ async def test_a_problem_is_fired_as_an_event(
 
     sessions[0].options["on_problem"](None, "The recording did not start")
     sessions[0].options["on_problem"](OFFICE, "It could not be kept in step")
+    # A follower with no state yet is named by its entity ID.
+    sessions[0].options["on_problem"](BACK_YARD, "It could not be kept in step")
     await hass.async_block_till_done()
 
     assert [event.data for event in events] == [
@@ -357,7 +411,12 @@ async def test_a_problem_is_fired_as_an_event(
         {
             "leader": LIVING_ROOM,
             "follower": OFFICE,
-            "message": "It could not be kept in step",
+            "message": "Office Channels: It could not be kept in step",
+        },
+        {
+            "leader": LIVING_ROOM,
+            "follower": BACK_YARD,
+            "message": f"{BACK_YARD}: It could not be kept in step",
         },
     ]
 

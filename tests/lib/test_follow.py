@@ -966,3 +966,109 @@ async def test_a_channel_change_as_the_settle_time_ends_starts_it_again(
     assert toggles(leader)
     assert min(toggles(leader)) >= leader.moved_at + 10.0
     assert problems == []
+
+
+def behind_the_edge(dvr: SimDvr, player: SimPlayer) -> float:
+    """Seconds a player on an in-progress recording is behind its live edge."""
+    recording = dvr.recordings[player.recording_id]
+    return (dvr.now() - recording.created_at) - player.position()
+
+
+async def cancel_when(session, clock, done) -> asyncio.Task:
+    """Run a session until `done()` is true, then cancel it; return its task."""
+    task = asyncio.create_task(session.run())
+    for _ in range(1000):
+        await clock.run_for(0.05)
+        if done():
+            break
+    assert done()
+    task.cancel()
+    return task
+
+
+async def test_a_stop_after_the_toggle_lets_the_leader_reach_the_recording(
+    clock, dvr, session, leader
+):
+    async def go_live() -> None:
+        await clock.sleep(5)
+        leader.watch_live("6.1")
+
+    live = asyncio.create_task(go_live())
+    task = await cancel_when(
+        session, clock, lambda: "toggle_record" in commands(leader)
+    )
+    await clock.run_for(0.5)
+    assert task.done()
+    await clock.run_for(60)
+    await live
+
+    recording = await dvr.in_progress_recording("6.1")
+    assert recording is not None
+    assert leader.recording_id == recording.id
+    assert leader.state == STATE_PLAYING
+    assert behind_the_edge(dvr, leader) == pytest.approx(5.0, abs=2.0)
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_a_stop_while_moving_onto_a_recording_lets_it_reach_the_edge(
+    clock, dvr, session, leader
+):
+    existing = dvr.add("6.1", age=600.0)
+
+    async def go_live() -> None:
+        await clock.sleep(5)
+        leader.watch_live("6.1")
+
+    live = asyncio.create_task(go_live())
+    task = await cancel_when(session, clock, lambda: bool(leader.calls))
+    await clock.run_for(0.5)
+    assert task.done()
+    await clock.run_for(60)
+    await live
+
+    assert leader.recording_id == existing.id
+    assert leader.state == STATE_PLAYING
+    assert behind_the_edge(dvr, leader) == pytest.approx(5.0, abs=2.0)
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_a_dvr_set_up_after_the_session_started_is_used(
+    clock, dvr, leader, office, problems
+):
+    available: list[SimDvr] = []
+    session = FollowSession(
+        leader,
+        {"office": Follower(office)},
+        dvr=lambda: available[0] if available else None,
+        clock=clock,
+        on_problem=lambda who, message: problems.append((who, message)),
+    )
+
+    async with running(session, clock):
+        await clock.run_for(5)
+        leader.watch_live("6.1")
+        await clock.run_for(5)
+        available.append(dvr)  # before the 10 s settle time is up
+        await clock.run_for(40)
+
+    recording = await dvr.in_progress_recording("6.1")
+    assert recording is not None
+    assert leader.recording_id == recording.id
+    assert office.recording_id == recording.id
+    assert problems == []
+
+
+async def test_a_follower_on_live_tv_is_put_on_the_leaders_recording(
+    clock, session, leader, office
+):
+    office.watch_live("3.1")
+
+    async with running(session, clock):
+        await clock.run_for(30)
+
+    assert office.recording_id == REC
+    assert office.state == STATE_PLAYING
+    assert abs(offset(leader, office)) <= CLOSE
+    assert "toggle_record" not in commands(office)

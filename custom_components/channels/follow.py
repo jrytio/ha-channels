@@ -97,6 +97,10 @@ def async_start_follow(
 
     @callback
     def problem(follower_id: str | None, message: str) -> None:
+        if follower_id is not None:
+            # The engine's follower messages begin "It ..."; say which TV.
+            state = hass.states.get(follower_id)
+            message = f"{state.name if state else follower_id}: {message}"
         hass.bus.async_fire(
             EVENT_FOLLOW_PROBLEM,
             {"leader": leader_id, "follower": follower_id, "message": message},
@@ -116,7 +120,8 @@ def async_start_follow(
             )
             for entity_id, entry in followers.items()
         },
-        dvr=async_get_dvr_client(hass),
+        # Looked up when needed: the DVR's entry may be set up after this.
+        dvr=lambda: async_get_dvr_client(hass),
         clock=SystemClock(),
         tolerance=tolerance,
         live_settle=live_settle,
