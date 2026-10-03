@@ -3,6 +3,7 @@
 from .app_client import DEFAULT_APP_PORT, AppClient
 from .clock import Clock, SystemClock
 from .dvr_client import DEFAULT_DVR_PORT, DvrClient
+from .follow import Follower, FollowSession
 from .models import (
     AppStatus,
     ChannelsConnectionError,
@@ -23,6 +24,8 @@ __all__ = [
     "Clock",
     "DvrClient",
     "FailedJob",
+    "FollowSession",
+    "Follower",
     "LeaderError",
     "Recording",
     "SwitchError",
