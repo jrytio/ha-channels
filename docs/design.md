@@ -151,6 +151,58 @@ loading, the paused keyframe seek and the job list described under Measured
 behaviour. The first two, and the job list as a guard for `toggle_record`,
 are handled as described below; the paused keyframe seek is a known limit.
 
+#### Follow session (2026-10-03)
+
+Run from a laptop with `scripts/bench.py follow` against a leader and one
+follower (both Apple TVs), with a third follower listed whose TV was off the
+network for the whole run, and the DVR server. Leader and follower actions
+were sent through the app API, which the session cannot tell from a remote.
+
+Reading noise, the follower lined up and nothing touched:
+
+| Run | Readings | Spread |
+| --- | --- | --- |
+| Watch only, 90 s | 15 | within 39 ms of the median; largest swing between consecutive readings 54 ms |
+| Session, 10 min unattended | 563 | standard deviation 18 ms; 11 beyond ±50 ms, 1 beyond ±100 ms (−102 ms), none beyond ±130 ms |
+
+The ten-minute session made no correction after the first, which followed a
+seek on the leader. The tolerance of 250 ms and the two-readings rule have
+room to spare.
+
+What the session did:
+
+| Action | Follower | In step (within 50 ms) again |
+| --- | --- | --- |
+| Leader paused | paused about 1 s later, 0.92 s from the leader's frame | held while paused |
+| Leader resumed | resumed about 1 s later | about 5 s |
+| Leader skipped +180 s | one plain seek, which landed 0.94 s short; then one fine-tune | about 5 s |
+| Leader rewound 30 s | one plain seek, then one fine-tune | about 4 s |
+| Leader skipped +30 s five times, 1 s apart | three plain seeks; no problem reported | 2 s after the last skip |
+| Leader played a different recording | started it, lined up | about 6 s |
+| Follower paused through its own app | resumed within about 1 s | about 5 s |
+| Follower seeked −20 s through its own app | pulled back within about 1 s | about 5 s |
+| Follower's TV asleep, leader skipped +90 s meanwhile, TV woken | nothing sent while asleep; came back paused on the recording, was resumed and seeked +115 s | about 8 s after its app answered |
+| Third follower, off the network throughout | `absent`; nothing sent | n/a |
+| Session interrupted during a hold | the resume was sent; the process ended 0.2 s after the interrupt; follower left playing | n/a |
+
+No plain seek had to be sent twice for one skip: a seek had landed by the
+next reading, 1 s later.
+
+Live TV:
+
+| Action | Result |
+| --- | --- |
+| Leader tuned to a channel that was not being recorded | no command for 9.8 s; then `toggle_record`, whose reply named the channel (`channel.number` present, `status: playing`, no recording); leader moved onto the new file 4 s later; follower on it and in step 21 s after the leader tuned |
+| Leader skipped +600 s on that in-progress file, far past the live edge | the leader reported the requested position, frozen, for about 2 s, then its real position at the edge; the follower was seeked by the same amount and both ended at the edge, in step, about 6 s after the skip; neither stalled |
+| Leader played a finished recording, then tuned to the same channel again while it was recording | moved onto the existing recording 0.2 s after tuning; no `toggle_record`; no second file |
+| Leader flipped through three channels, 4 s on each | no `toggle_record`; nothing sent to the follower |
+
+Two things could not be established from the laptop and are left for a
+person at the TV: whether pressing Home on a follower that is playing takes
+it out of the app (its API kept answering and it kept being followed, so it
+may have gone to picture-in-picture), and how a paused follower's keyframe
+seeks look on screen.
+
 ## The `channels` integration
 
 ### Repo and install
