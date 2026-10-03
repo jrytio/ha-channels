@@ -45,14 +45,27 @@ class FakeSession:
         self.options = options
         self.statuses = dict.fromkeys(followers, "absent")
         self.cancelled = False
+        self.ended = asyncio.Event()
+        self.failure: Exception | None = None
         FakeSession.instances.append(self)
 
     async def run(self) -> None:
         try:
-            await asyncio.Event().wait()
+            await self.ended.wait()
         except asyncio.CancelledError:
             self.cancelled = True
             raise
+        if self.failure:
+            raise self.failure
+
+    def finish(self) -> None:
+        """End run() by returning."""
+        self.ended.set()
+
+    def fail(self) -> None:
+        """End run() by raising."""
+        self.failure = RuntimeError("the session broke")
+        self.ended.set()
 
     def set_status(self, follower: str, status: str) -> None:
         self.statuses[follower] = status
@@ -188,6 +201,79 @@ async def test_a_tv_cannot_follow_two_leaders_or_lead_while_following(
 
     assert len(sessions) == 1
     assert not sessions[0].cancelled
+
+
+async def test_a_leader_cannot_be_made_a_follower(
+    hass, living_room_entry, office_entry, clients, sessions
+):
+    app_entry(hass, "Back Yard", "10.0.0.3")
+    await setup_integration(hass)
+    await start_follow(hass)
+
+    with pytest.raises(ServiceValidationError, match="leading"):
+        await start_follow(hass, leader=BACK_YARD, followers=[LIVING_ROOM])
+
+    assert len(sessions) == 1
+    assert not sessions[0].cancelled
+
+
+async def test_no_followers_left_starts_no_session(
+    hass, living_room_entry, office_entry, clients, sessions
+):
+    await setup_integration(hass)
+
+    await start_follow(hass, followers=[BACK_YARD])
+
+    assert sessions == []
+    assert "followed_by" not in hass.states.get(LIVING_ROOM).attributes
+
+
+async def test_no_followers_left_ends_the_leaders_session(
+    hass, living_room_entry, office_entry, clients, sessions
+):
+    await setup_integration(hass)
+    await start_follow(hass)
+
+    await start_follow(hass, followers=[LIVING_ROOM])
+
+    assert len(sessions) == 1
+    assert sessions[0].cancelled
+    assert "following" not in hass.states.get(OFFICE).attributes
+    assert "followed_by" not in hass.states.get(LIVING_ROOM).attributes
+
+
+@pytest.mark.parametrize("how", ["finish", "fail"])
+async def test_a_session_that_ends_by_itself_is_forgotten(
+    hass, living_room_entry, office_entry, clients, sessions, caplog, how
+):
+    app_entry(hass, "Back Yard", "10.0.0.3")
+    await setup_integration(hass)
+    await start_follow(hass)
+
+    getattr(sessions[0], how)()
+    # Background tasks are not waited for by async_block_till_done.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await hass.async_block_till_done()
+
+    assert "following" not in hass.states.get(OFFICE).attributes
+    assert "followed_by" not in hass.states.get(LIVING_ROOM).attributes
+    assert ("the session broke" in caplog.text) == (how == "fail")
+    await start_follow(hass, leader=BACK_YARD, followers=[OFFICE])
+    assert len(sessions) == 2
+
+
+async def test_a_replaced_sessions_end_does_not_remove_its_successor(
+    hass, living_room_entry, office_entry, clients, sessions
+):
+    await setup_integration(hass)
+
+    await start_follow(hass)
+    await start_follow(hass)
+    await hass.async_block_till_done()
+
+    assert sessions[0].cancelled
+    assert hass.states.get(LIVING_ROOM).attributes["followed_by"] == [OFFICE]
 
 
 async def test_starting_again_replaces_the_session(

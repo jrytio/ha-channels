@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import logging
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -24,6 +25,8 @@ from .lib import (
     FollowSession,
     SystemClock,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 _SESSIONS = "follow_sessions"
 NOT_LOADED = "Its Channels entry is not loaded"
@@ -125,9 +128,24 @@ def async_start_follow(
     task = leader_entry.async_create_background_task(
         hass, session.run(), f"{DOMAIN} follow {leader_id}"
     )
-    _sessions(hass)[leader_entry.entry_id] = RunningSession(
-        leader_id, list(followers), session, task
-    )
+    running = RunningSession(leader_id, list(followers), session, task)
+    _sessions(hass)[leader_entry.entry_id] = running
+
+    @callback
+    def ended(task: asyncio.Task[None]) -> None:
+        # A stopped or replaced session has already left the registry; only
+        # remove this one, never a successor under the same leader.
+        if _sessions(hass).get(leader_entry.entry_id) is running:
+            del _sessions(hass)[leader_entry.entry_id]
+        if not task.cancelled() and (error := task.exception()) is not None:
+            _LOGGER.error(
+                "The follow session of %s ended unexpectedly",
+                leader_id,
+                exc_info=error,
+            )
+        async_dispatcher_send(hass, SIGNAL_FOLLOW_UPDATED)
+
+    task.add_done_callback(ended)
     async_dispatcher_send(hass, SIGNAL_FOLLOW_UPDATED)
 
 
@@ -149,6 +167,12 @@ def async_leader_of(hass: HomeAssistant, entity_id: str) -> str | None:
         if entity_id in running.follower_ids:
             return running.leader_id
     return None
+
+
+@callback
+def async_is_leading(hass: HomeAssistant, entity_id: str) -> bool:
+    """Return whether an entity is the leader of a running session."""
+    return any(running.leader_id == entity_id for running in _sessions(hass).values())
 
 
 @callback

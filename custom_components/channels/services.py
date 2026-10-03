@@ -37,7 +37,12 @@ from .const import (
     SERVICE_SWITCH_TO_RECORDING,
     SERVICE_SYNC_PLAYBACK,
 )
-from .follow import async_leader_of, async_start_follow, async_stop_follow
+from .follow import (
+    async_is_leading,
+    async_leader_of,
+    async_start_follow,
+    async_stop_follow,
+)
 from .helpers import async_get_app_entry, async_get_dvr_client, is_loaded
 from .lib import (
     ChannelsError,
@@ -287,7 +292,16 @@ async def _async_start_follow(call: ServiceCall) -> None:
             continue
         if (other := async_leader_of(hass, entity_id)) not in (None, leader_id):
             raise ServiceValidationError(f"{entity_id} is already following {other}")
+        if async_is_leading(hass, entity_id):
+            raise ServiceValidationError(
+                f"{entity_id} is leading a follow session of its own"
+            )
         followers[entity_id] = entry
+
+    if not followers:
+        # Nobody to keep in line; a session would only move the leader for no one.
+        async_stop_follow(hass, leader_entry.entry_id)
+        return
 
     async_start_follow(
         hass,
